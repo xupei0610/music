@@ -1,0 +1,35 @@
+<mujocoinclude model="MUSIC-Hand-v0.15">
+        <actuator>
+            <position name="R:elbow_x" joint="R:elbow_x" ctrllimited="true" ctrlrange="-2 2" forcelimited="true" forcerange="-50 50" kp="20" kv="2"/>
+            <position name="R:elbow_y" joint="R:elbow_y" ctrllimited="true" ctrlrange="-2 2" forcelimited="true" forcerange="-50 50" kp="20" kv="2"/>
+            <position name="R:elbow_z" joint="R:elbow_z" ctrllimited="true" ctrlrange="-2 2" forcelimited="true" forcerange="-50 50" kp="20" kv="2"/>
+            <position name="R:elbow_rx" joint="R:elbow_rx" ctrllimited="true" ctrlrange="-2 2" forcelimited="true" forcerange="-50 50" kp="10" kv="1"/>
+            <position name="R:elbow_ry" joint="R:elbow_ry" ctrllimited="true" ctrlrange="-2 2" forcelimited="true" forcerange="-50 50" kp="10" kv="1"/>
+            <position name="R:elbow_rz" joint="R:elbow_rz" ctrllimited="true" ctrlrange="-2 2" forcelimited="true" forcerange="-50 50" kp="10" kv="1"/>
+    
+            <position name="R:pro_sup" joint="R:pro_sup" ctrllimited="true" ctrlrange="-2 2" forcelimited="true" forcerange="-20 20" kp="10" kv="0.1" />
+            <position name="R:deviation" joint="R:deviation" ctrllimited="true" ctrlrange="-2 2" forcelimited="true" forcerange="-20 20" kp="10" kv="0.1" />
+            <position name="R:flexion" joint="R:flexion" ctrllimited="true" ctrlrange="-2 2" forcelimited="true" forcerange="-20 20" kp="10" kv="0.1" />
+    
+            <position name="R:cmc_abduction" joint="R:cmc_abduction" ctrllimited="true" ctrlrange="-2 2" forcelimited="true" forcerange="-10 10" kp="10" kv="0.1" />
+            <position name="R:cmc_flexion" joint="R:cmc_flexion" ctrllimited="true" ctrlrange="-2 2" forcelimited="true" forcerange="-10 10" kp="10" kv="0.1" />
+            <position name="R:mp_flexion" joint="R:mp_flexion" ctrllimited="true" ctrlrange="-2 2" forcelimited="true" forcerange="-10 10" kp="10" kv="0.1" />
+            <position name="R:ip_flexion" joint="R:ip_flexion" ctrllimited="true" ctrlrange="-2 2" forcelimited="true" forcerange="-10 10" kp="10" kv="0.1" />
+            <position name="R:mcp2_flexion" joint="R:mcp2_flexion" ctrllimited="true" ctrlrange="-2 2" forcelimited="true" forcerange="-10 10" kp="10" kv="0.1" />
+            <position name="R:mcp2_abduction" joint="R:mcp2_abduction" ctrllimited="true" ctrlrange="-2 2" forcelimited="true" forcerange="-10 10" kp="10" kv="0.1" />
+            <position name="R:pm2_flexion" joint="R:pm2_flexion" ctrllimited="true" ctrlrange="-2 2" forcelimited="true" forcerange="-10 10" kp="10" kv="0.1" />
+            <position name="R:md2_flexion" joint="R:md2_flexion" ctrllimited="true" ctrlrange="-2 2" forcelimited="true" forcerange="-10 10" kp="10" kv="0.1" />
+            <position name="R:mcp3_flexion" joint="R:mcp3_flexion" ctrllimited="true" ctrlrange="-2 2" forcelimited="true" forcerange="-10 10" kp="10" kv="0.1" />
+            <position name="R:mcp3_abduction" joint="R:mcp3_abduction" ctrllimited="true" ctrlrange="-2 2" forcelimited="true" forcerange="-10 10" kp="10" kv="0.1" />
+            <position name="R:pm3_flexion" joint="R:pm3_flexion" ctrllimited="true" ctrlrange="-2 2" forcelimited="true" forcerange="-10 10" kp="10" kv="0.1" />
+            <position name="R:md3_flexion" joint="R:md3_flexion" ctrllimited="true" ctrlrange="-2 2" forcelimited="true" forcerange="-10 10" kp="10" kv="0.1" />
+            <position name="R:mcp4_flexion" joint="R:mcp4_flexion" ctrllimited="true" ctrlrange="-2 2" forcelimited="true" forcerange="-10 10" kp="10" kv="0.1" />
+            <position name="R:mcp4_abduction" joint="R:mcp4_abduction" ctrllimited="true" ctrlrange="-2 2" forcelimited="true" forcerange="-10 10" kp="10" kv="0.1" />
+            <position name="R:pm4_flexion" joint="R:pm4_flexion" ctrllimited="true" ctrlrange="-2 2" forcelimited="true" forcerange="-10 10" kp="10" kv="0.1" />
+            <position name="R:md4_flexion" joint="R:md4_flexion" ctrllimited="true" ctrlrange="-2 2" forcelimited="true" forcerange="-10 10" kp="10" kv="0.1" />
+            <position name="R:mcp5_flexion" joint="R:mcp5_flexion" ctrllimited="true" ctrlrange="-2 2" forcelimited="true" forcerange="-10 10" kp="10" kv="0.1" />
+            <position name="R:mcp5_abduction" joint="R:mcp5_abduction" ctrllimited="true" ctrlrange="-2 2" forcelimited="true" forcerange="-10 10" kp="10" kv="0.1" />
+            <position name="R:pm5_flexion" joint="R:pm5_flexion" ctrllimited="true" ctrlrange="-2 2" forcelimited="true" forcerange="-10 10" kp="10" kv="0.1" />
+            <position name="R:md5_flexion" joint="R:md5_flexion" ctrllimited="true" ctrlrange="-2 2" forcelimited="true" forcerange="-10 10" kp="10" kv="0.1" />
+        </actuator>
+</mujocoinclude>

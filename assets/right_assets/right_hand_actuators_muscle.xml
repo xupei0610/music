@@ -1,0 +1,69 @@
+<mujocoinclude model="MUSIC-Hand-v0.15">
+<!-- Modified from MyoHand and add five additional muscle-tendon units: AdP, FPB, APB, ADM, and FDM. -->
+
+<!-- original license from MyoHand
+    =================================================
+	Copyright 2020 Vikash Kumar, Vittorio Caggiano, Huawei Wang
+	Model	:: Myo Hand (MuJoCoV2.0)
+	Author	:: Vikash Kumar (vikashplus@gmail.com), Vittorio Caggiano, Huawei Wang
+	source	:: https://github.com/vikashplus
+	License	:: Under Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0 Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License. 
+    ======================================================
+-->
+    <actuator>
+        <muscle name="R:ECRL" force="337.3" class="muscle" tendon="R:ECRL_tendon" lengthrange="0.313191 0.341072"/>
+        <muscle name="R:ECRB" force="252.2" class="muscle" tendon="R:ECRB_tendon" lengthrange="0.26997 0.301495"/>
+        <muscle name="R:ECU" force="192.9" class="muscle" tendon="R:ECU_tendon" lengthrange="0.279041 0.306754"/>
+        <muscle name="R:FCR" force="407.9" class="muscle" tendon="R:FCR_tendon" lengthrange="0.295866 0.331494"/>
+        <muscle name="R:FCU" force="479.8" class="muscle" tendon="R:FCU_tendon" lengthrange="0.293357 0.332707"/>
+        <muscle name="R:PL" force="101.0" class="muscle" tendon="R:PL_tendon" lengthrange="0.311593 0.362396"/>
+        <muscle name="R:PT" force="557.2" class="muscle" tendon="R:PT_tendon" lengthrange="0.147243 0.170204"/>
+        <muscle name="R:PQ" force="284.7" class="muscle" tendon="R:PQ_tendon" lengthrange="0.0220792 0.0371669"/>
+        <muscle name="R:FDS5" force="75.3" class="muscle" tendon="R:FDS5_tendon" lengthrange="0.354916 0.423992"/>
+        <muscle name="R:FDS4" force="171.2" class="muscle" tendon="R:FDS4_tendon" lengthrange="0.422088 0.480218"/>
+        <muscle name="R:FDS3" force="258.8" class="muscle" tendon="R:FDS3_tendon" lengthrange="0.328489 0.390589"/>
+        <muscle name="R:FDS2" force="162.5" class="muscle" tendon="R:FDS2_tendon" lengthrange="0.330149 0.392331"/>
+        <muscle name="R:FDP5" force="236.8" class="muscle" tendon="R:FDP5_tendon" lengthrange="0.387224 0.450745"/>
+        <muscle name="R:FDP4" force="172.9" class="muscle" tendon="R:FDP4_tendon" lengthrange="0.348164 0.417976"/>
+        <muscle name="R:FDP3" force="212.4" class="muscle" tendon="R:FDP3_tendon" lengthrange="0.336078 0.398672"/>
+        <muscle name="R:FDP2" force="197.3" class="muscle" tendon="R:FDP2_tendon" lengthrange="0.336953 0.40261"/>
+        <muscle name="R:EDC5" force="139.4" class="muscle" tendon="R:EDC5_tendon" lengthrange="0.381709 0.426592"/>
+        <muscle name="R:EDC4" force="109.2" class="muscle" tendon="R:EDC4_tendon" lengthrange="0.391706 0.456154"/>
+        <muscle name="R:EDC3" force="94.4" class="muscle" tendon="R:EDC3_tendon" lengthrange="0.399791 0.456735"/>
+        <muscle name="R:EDC2" force="48.8" class="muscle" tendon="R:EDC2_tendon" lengthrange="0.395914 0.455475"/>
+        <muscle name="R:EDM" force="72.4" class="muscle" tendon="R:EDM_tendon" lengthrange="0.37707 0.417549"/>
+        <muscle name="R:EIP" force="47.3" class="muscle" tendon="R:EIP_tendon" lengthrange="0.245809 0.291046"/>
+        <muscle name="R:EPL" force="88.3" class="muscle" tendon="R:EPL_tendon" lengthrange="0.253147 0.327478"/>
+        <muscle name="R:EPB" force="46" class="muscle" tendon="R:EPB_tendon" lengthrange="0.146292 0.199276"/>
+        <muscle name="R:FPL" force="201" class="muscle" tendon="R:FPL_tendon" lengthrange="0.22287 0.27967"/>
+        <muscle name="R:APL" force="116.7" class="muscle" tendon="R:APL_tendon" lengthrange="0.204756 0.228384"/>
+        <muscle name="R:OP" force="180" class="muscle" tendon="R:OP_tendon" lengthrange="0.0314264 0.0518708"/>
+        <!-- MUSIC-Hand Added Muscle Property Start-->
+        <muscle name="R:FPB" force="80" class="muscle" tendon="R:FPB_tendon" lengthrange="0.060 0.080"/>
+        <muscle name="R:AdP" force="100" class="muscle" tendon="R:AdP_tendon" lengthrange="0.040 0.060"/>
+        <muscle name="R:APB" force="42.7" class="muscle" tendon="R:APB_tendon" lengthrange="0.055 0.075"/>
+        <muscle name="R:FDM" force="30" class="muscle" tendon="R:FDM_tendon" lengthrange="0.065 0.085"/>
+        <muscle name="R:ADM" force="12.3" class="muscle" tendon="R:ADM_tendon" lengthrange="0.055 0.075"/>
+        <!-- MUSIC-Hand Added Muscle Property End-->
+        <muscle name="R:RI2" force="61.2" class="muscle" tendon="R:RI2_tendon" lengthrange="0.0314087 0.0423628"/>
+        <muscle name="R:LU_RB2" force="61.2" class="muscle" tendon="R:LU_RB2_tendon" lengthrange="0.0898587 0.0998069"/>
+        <muscle name="R:UI_UB2" force="61.2" class="muscle" tendon="R:UI_UB2_tendon" lengthrange="0.0913261 0.105141"/>
+        <muscle name="R:RI3" force="61.2" class="muscle" tendon="R:RI3_tendon" lengthrange="0.0358365 0.0509725"/>
+        <muscle name="R:LU_RB3" force="98" class="muscle" tendon="R:LU_RB3_tendon" lengthrange="0.0827603 0.0988323"/>
+        <muscle name="R:UI_UB3" force="98" class="muscle" tendon="R:UI_UB3_tendon" lengthrange="0.0853434 0.0997261"/>
+        <muscle name="R:RI4" force="97.0" class="muscle" tendon="R:RI4_tendon" lengthrange="0.0435566 0.058459"/>
+        <muscle name="R:LU_RB4" force="76.9" class="muscle" tendon="R:LU_RB4_tendon" lengthrange="0.0797904 0.0909592"/>
+        <muscle name="R:UI_UB4" force="76.9" class="muscle" tendon="R:UI_UB4_tendon" lengthrange="0.0819919 0.0969029"/>
+        <muscle name="R:RI5" force="59.9" class="muscle" tendon="R:RI5_tendon" lengthrange="0.0425128 0.0462661"/>
+        <muscle name="R:LU_RB5" force="47.9" class="muscle" tendon="R:LU_RB5_tendon" lengthrange="0.0970142 0.100417"/>
+        <muscle name="R:UI_UB5" force="47.9" class="muscle" tendon="R:UI_UB5_tendon" lengthrange="0.0910226 0.0976845"/>
+
+
+        <motor site="R:root_joint" name="R:force_x" ctrlrange="-100 100" ctrllimited="true" forcerange="-100 100" gear="1 0 0 0 0 0"/>
+        <motor site="R:root_joint" name="R:force_y" ctrlrange="-100 100" ctrllimited="true" forcerange="-100 100" gear="0 1 0 0 0 0"/>
+        <motor site="R:root_joint" name="R:force_z" ctrlrange="-100 100" ctrllimited="true" forcerange="-100 100" gear="0 0 1 0 0 0"/>
+        <motor site="R:root_joint" name="R:torque_x" ctrlrange="-100 100" ctrllimited="true" forcerange="-100 100" gear="0 0 0 1 0 0"/>
+        <motor site="R:root_joint" name="R:torque_y" ctrlrange="-100 100" ctrllimited="true" forcerange="-100 100" gear="0 0 0 0 1 0"/>
+        <motor site="R:root_joint" name="R:torque_z" ctrlrange="-100 100" ctrllimited="true" forcerange="-100 100" gear="0 0 0 0 0 1"/>
+    </actuator>
+</mujocoinclude>

@@ -1,0 +1,74 @@
+<mujocoinclude model="MUSIC-Hand-v0.15">
+        <compiler inertiafromgeom="auto" angle="radian" balanceinertia="true" boundmass="0.001" boundinertia=".0001" meshdir="." texturedir="."/>
+        <size njmax="1000" nconmax="400" nuser_jnt="1"/>
+        <!-- 480 FPS -->
+        <option timestep="0.00208333333" impratio="10" gravity="0 0 0"/> 
+    
+        <asset>
+            <texture name="texgeom" type="cube" builtin="flat" mark="cross" width="127" height="1278" rgb1="0.7 0.7 0.7" rgb2="0.9 0.9 0.9" markrgb="1 1 1" random="0.01"/>
+            <material name="geom" texture="texgeom" texuniform="true"/>
+            <material name="MatSkin" specular="0.2" shininess=".1" reflectance="0.5" rgba="0.9 .7 .5 1"/>
+        </asset>
+        
+        <default>
+            <default class="music-hand">
+              <joint limited="true" damping="0.05" armature="1e-4" stiffness="0"/>
+              <geom contype="0" conaffinity="0" condim="3" rgba="0.8 0.8 .8 1" solref=".02 1" solimp=".8 .8 .01" material="geom"/>
+              <site size="0.0012" rgba=".2 .6 .2 1" group="3"/>
+              <tendon width="0.001" rgba=".95 .3 .3 1" limited="false" />
+              <default class="L:skin_arm">
+                <geom type="capsule" group="5" contype="56" conaffinity="4" condim="1" rgba="0.8 0.7 .5 1" margin="0.001" material="MatSkin"/>
+              </default>
+              <default class="L:skin_palm">
+                <geom type="capsule" group="4" contype="56" conaffinity="2" condim="3" rgba="0.8 0.7 .5 1" margin="0.001" material="MatSkin"/>
+              </default>
+              <default class="L:skin_finger">
+                <geom type="capsule" group="5" contype="59" conaffinity="1" condim="3" rgba="0.8 0.7 .5 1" margin="0.001" material="MatSkin"/>
+              </default>
+              <default class="R:skin_arm">
+                <geom type="capsule" group="5" contype="7" conaffinity="32" condim="1" rgba="0.8 0.7 .5 1" margin="0.001" material="MatSkin"/>
+              </default>
+              <default class="R:skin_palm">
+                <geom type="capsule" group="4" contype="7" conaffinity="16" condim="3" rgba="0.8 0.7 .5 1" margin="0.001" material="MatSkin"/>
+              </default>
+              <default class="R:skin_finger">
+                <geom type="capsule" group="5" contype="31" conaffinity="8" condim="3" rgba="0.8 0.7 .5 1" margin="0.001" material="MatSkin"/>
+              </default>
+              <default class="wrap">
+                <geom rgba=".5 .5 .9 1" group="3" contype="0" conaffinity="0"/>
+              </default>
+              <default class="muscle">
+                <muscle ctrllimited="true" ctrlrange="0 1" />
+              </default>
+            </default>
+            <default class="white_key">
+            <!--   range limit is decided by end position with travel depth of 0.01 i.e. arcsin(0.01/0.148)   -->
+            <joint type="hinge" axis="1 0 0" pos="0 0 0" limited="true" range="-0.0676190854 0" solreflimit=".01 1" solimplimit=".95 .99 .001" stiffness="2" damping="0.05" armature="1e-3" />
+            <geom group="2" type="box" condim="3" contype="9" conaffinity="0" solref=".02 1" solimp=".9 .95 .001" margin="0" priority="1" size="0.011313735 0.074 0.0105" pos="0 0.074 0" mass="0.04" rgba=".9 .9 .9 1"/>
+            </default>
+            <default class="black_key">
+            <!--   range limit is decided by end position with travel depth of 0.008, i.e. arcsin(0.008/0.096)   -->
+            <joint type="hinge" axis="1 0 0" pos="0 0 0" limited="true" range="-0.08333333333 0" solreflimit=".01 1" solimplimit=".95 .99 .001" stiffness="2" damping="0.05" armature="1e-3" />
+            <!--   top width 0.0095, bottom width 0.011, bottom width with spacing 0.015   -->
+            <geom group="2" type="box" condim="3" contype="9" conaffinity="0" solref=".02 1" solimp=".9 .95 .001" margin="0" priority="1" size="0.00475 0.048 0.01" pos="0 0.048 0" mass="0.02" rgba=".1 .1 .1 1"/>
+            </default>
+        </default>
+
+        <!-- contype    conaffinity
+        white   1+8         0
+        black   1+8         0
+
+        arm     32+16+8     4
+        palm    32+16+8     2
+        fingers 32+16+8+1+2 1
+
+        arm     4+2+1       32
+        palm    4+2+1       16
+        fingers 4+2+1+8+16  8 -->
+        
+      <custom>
+        <numeric data="30" name="max_contact_points"/>
+        <numeric data="500" name="max_geom_pairs"/>
+      </custom>
+      
+</mujocoinclude>

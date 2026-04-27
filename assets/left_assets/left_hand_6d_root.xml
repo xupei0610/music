@@ -1,0 +1,15 @@
+<mujocoinclude model="MUSIC-Hand-v0.15">
+            <body childclass="music-hand" name="L:ulna" pos="-0 0 0">
+                <joint type="slide" axis="1 0 0" limited="true" range="-0.65 0.65" stiffness="0" damping="5" armature="0.001" name="L:elbow_x" />
+                <joint type="slide" axis="0 1 0" limited="true" range="0.2 0.7" stiffness="0" damping="5" armature="0.001" name="L:elbow_y" />
+                <joint type="slide" axis="0 0 1" limited="true" range="-0.2 0.3" stiffness="0" damping="5" armature="0.001" name="L:elbow_z" />
+                <joint type="hinge" axis="1 0 0" limited="true" range="-3.14 3.14" stiffness="0" damping="0.5" armature="0.001" name="L:elbow_rx" />
+                <joint type="hinge" axis="0 1 0" limited="true" range="-3.14 3.14" stiffness="0" damping="0.5" armature="0.001" name="L:elbow_ry" />
+                <joint type="hinge" axis="0 0 1" limited="true" range="-3.14 3.14" stiffness="0" damping="0.5" armature="0.001" name="L:elbow_rz" />
+        
+                <!-- <joint type="free" name="L:root_joint" /> -->
+                <!-- <site name="L:root_joint" /> -->
+
+                <include file="left_assets/left_hand_definition.xml" />
+            </body>
+</mujocoinclude>

@@ -1,0 +1,444 @@
+<mujocoinclude model="MUSIC-Hand-v0.15">
+<!-- Modified from MyoHand and add five additional muscle-tendon units: AdP, FPB, APB, ADM, and FDM. -->
+
+<!-- original license from MyoHand
+    =================================================
+	Copyright 2020 Vikash Kumar, Vittorio Caggiano, Huawei Wang
+	Model	:: Myo Hand (MuJoCoV2.0)
+	Author	:: Vikash Kumar (vikashplus@gmail.com), Vittorio Caggiano, Huawei Wang
+	source	:: https://github.com/vikashplus
+	License	:: Under Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0 Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License. 
+    ======================================================
+-->
+    <tendon>
+        <spatial class="music-hand" name="R:ECRL_tendon">
+          <site site="R:ECRL-P1"/>
+          <geom geom="R:Elbow_PT_ECRL_wrap" sidesite="R:Elbow_PT_ECRL_site_ECRL_side"></geom>
+          <site site="R:ECRL-P2"/>
+          <site site="R:ECRL-P3"/>
+          <geom geom="R:ECRL_torus_wrap" sidesite="R:ECRL_torus_site_ECRL_side"/>
+          <site site="R:ECRL-P4"/>
+        </spatial>
+        <spatial class="music-hand" name="R:ECRB_tendon">
+          <site site="R:ECRB-P1"/>
+          <site site="R:ECRB-P2"/>
+          <site site="R:ECRB-P3"/>
+          <geom geom="R:ECRB_torus_wrap" sidesite="R:ECRB_torus_site_ECRB_side"/>
+          <site site="R:ECRB-P4"/>
+        </spatial>
+        <spatial class="music-hand" name="R:ECU_tendon">
+          <site site="R:ECU-P1"/>
+          <site site="R:ECU-P2"/>
+          <site site="R:ECU-P3"/>
+          <site site="R:ECU-P4"/>
+          <site site="R:ECU-P5"/>
+          <geom geom="R:ECU_torus_wrap" sidesite="R:ECU_torus_site_ECU_side"/>
+          <site site="R:ECU-P6"/>
+        </spatial>
+        <spatial class="music-hand" name="R:FCR_tendon">
+          <site site="R:FCR-P1"/>
+          <geom geom="R:Elbow_PT_FCU_wrap" sidesite="R:Elbow_PT_FCU_site_FCU_side"></geom>
+          <site site="R:FCR-P2"/>
+          <geom geom="R:FCR_torus_wrap" sidesite="R:FCR_torus_site_FCR_side"/>
+          <site site="R:FCR-P3"/>
+        </spatial>
+        <spatial class="music-hand" name="R:FCU_tendon">
+          <site site="R:FCU-P1"/>
+          <geom geom="R:Elbow_PT_FCU_wrap" sidesite="R:Elbow_PT_FCU_site_FCU_side"></geom>
+          <site site="R:FCU-P2"/>
+          <site site="R:FCU-P3"/>
+          <!-- <geom geom="R:FCU_torus_wrap" sidesite="R:FCU_torus_site_FCU_side"/> -->
+          <site site="R:FCU-P4"/>
+          <site site="R:FCU-P5"/>
+        </spatial>
+        <spatial class="music-hand" name="R:PL_tendon">
+          <site site="R:PL-P1"/>
+          <geom geom="R:Elbow_PT_FCU_wrap" sidesite="R:Elbow_PT_FCU_site_FCU_side"></geom>
+          <site site="R:PL-P2"/>
+          <!-- <geom geom="R:PL_ellipsoid_wrap" sidesite="R:PL_ellipsoid_site_PL_side"/> -->
+          <site site="R:PL-P3"/>
+          <site site="R:PL-P4"/>
+        </spatial>
+        <spatial class="music-hand" name="R:PT_tendon">
+          <site site="R:PT-P1"/>
+          <geom geom="R:Elbow_PT_FCU_wrap" sidesite="R:Elbow_PT_FCU_site_FCU_side"></geom>
+          <site site="R:PT-P2"/>
+          <site site="R:PT-P3"/>
+          <site site="R:PT-P4"/>
+          <site site="R:PT-P5"/>
+        </spatial>
+        <spatial class="music-hand" name="R:PQ_tendon">
+          <site site="R:PQ-P1"/>
+          <geom geom="R:PQ2_wrap" sidesite="R:PQ2_site_PQ_side"/>
+          <site site="R:PQ-P2"/>
+        </spatial>
+        <spatial class="music-hand" name="R:FDS5_tendon">
+          <site site="R:FDS5-P1"/>
+          <geom geom="R:Elbow_PT_FCU_wrap" sidesite="R:Elbow_PT_FCU_site_FCU_side"></geom>
+          <site site="R:FDS5-P2"/>
+          <geom geom="R:FDS_ellipsoid_wrap" sidesite="R:FDS_ellipsoid_site_FDS5_side"/>
+          <site site="R:FDS5-P3"/>
+          <site site="R:FDS5-P4"/>
+          <site site="R:FDS5-P5"/>
+          <!-- <geom geom="R:5thmcp_ellipsoid_wrap" sidesite="R:5thmcp_ellipsoid_site_FDS5_side"/> -->
+          <site site="R:FDS5-P6"/>
+          <site site="R:FDS5-P7"/>
+          <site site="R:FDS5-P8"/>
+        </spatial>
+        <spatial class="music-hand" name="R:FDS4_tendon">
+          <site site="R:FDS4-P1"/>
+          <geom geom="R:Elbow_PT_FCU_wrap" sidesite="R:Elbow_PT_FCU_site_FCU_side"></geom>
+          <site site="R:FDS4-P2"/>
+          <geom geom="R:FDS_ellipsoid_wrap" sidesite="R:FDS_ellipsoid_site_FDS4_side"/>
+          <site site="R:FDS4-P3"/>
+          <!-- <geom geom="R:4thmcp_ellipsoid_wrap" sidesite="R:4thmcp_ellipsoid_site_FDS4_side"/> -->
+          <site site="R:FDS4-P4"/>
+          <site site="R:FDS4-P5"/>
+          <!-- <geom geom="R:4thmcp_ellipsoid_wrap" sidesite="R:4thmcp_ellipsoid_site_FDS4_side"/> -->
+          <site site="R:FDS4-P6"/>
+          <site site="R:FDS4-P7"/>
+          <site site="R:FDS4-P8"/>
+        </spatial>
+        <spatial class="music-hand" name="R:FDS3_tendon">
+          <site site="R:FDS3-P1"/>
+          <site site="R:FDS3-P2"/>
+          <geom geom="R:FDS_ellipsoid_wrap" sidesite="R:FDS_ellipsoid_site_FDS3_side"/>
+          <site site="R:FDS3-P3"/>
+          <site site="R:FDS3-P4"/>
+          <!-- <site site="R:FDS3-P5"/> -->
+          <site site="R:FDS3-P6"/>
+          <site site="R:FDS3-P7"/>
+          <site site="R:FDS3-P8"/>
+        </spatial>
+        <spatial class="music-hand" name="R:FDS2_tendon">
+          <site site="R:FDS2-P1"/>
+          <site site="R:FDS2-P2"/>
+          <geom geom="R:FDS_ellipsoid_wrap" sidesite="R:FDS_ellipsoid_site_FDS2_side"/>
+          <site site="R:FDS2-P3"/>
+          <site site="R:FDS2-P4"/>
+          <site site="R:FDS2-P5"/>
+          <site site="R:FDS2-P6"/>
+          <site site="R:FDS2-P7"/>
+          <site site="R:FDS2-P8"/>
+        </spatial>
+        <spatial class="music-hand" name="R:FDP5_tendon">
+          <site site="R:FDP5-P1"/>
+          <site site="R:FDP5-P2"/>
+          <geom geom="R:FDP_ellipsoid_wrap" sidesite="R:FDP_ellipsoid_site_FDP5_side"/>
+          <site site="R:FDP5-P3"/>
+          <site site="R:FDP5-P4"/>
+          <!-- <geom geom="R:5thmcp_ellipsoid_wrap" sidesite="R:5thmcp_ellipsoid_site_FDP5_side"/> -->
+          <site site="R:FDP5-P5"/>
+          <site site="R:FDP5-P6"/>
+          <site site="R:FDP5-P7"/>
+          <site site="R:FDP5-P8"/>
+          <site site="R:FDP5-P9"/>
+          <site site="R:FDP5-P10"/>
+        </spatial>
+        <spatial class="music-hand" name="R:FDP4_tendon">
+          <site site="R:FDP4-P1"/>
+          <site site="R:FDP4-P2"/>
+          <geom geom="R:FDP_ellipsoid_wrap" sidesite="R:FDP_ellipsoid_site_FDP4_side"/>
+          <site site="R:FDP4-P3"/>
+          <site site="R:FDP4-P4"/>
+          <geom geom="R:4thmcp_ellipsoid_wrap" sidesite="R:4thmcp_ellipsoid_site_FDP4_side"/>
+          <site site="R:FDP4-P5"/>
+          <site site="R:FDP4-P6"/>
+          <!-- <site site="R:FDP4-P7"/> -->
+          <site site="R:FDP4-P8"/>
+          <site site="R:FDP4-P9"/>
+          <site site="R:FDP4-P10"/>
+        </spatial>
+        <spatial class="music-hand" name="R:FDP3_tendon">
+          <site site="R:FDP3-P1"/>
+          <site site="R:FDP3-P2"/>
+          <geom geom="R:FDP_ellipsoid_wrap" sidesite="R:FDP_ellipsoid_site_FDP3_side"/>
+          <site site="R:FDP3-P3"/>
+          <site site="R:FDP3-P4"/>
+          <site site="R:FDP3-P5"/>
+          <!-- <geom geom="R:3rdmcp_ellipsoid_wrap" sidesite="R:3rdmcp_ellipsoid_site_FDP3_side"/> -->
+          <site site="R:FDP3-P6"/>
+          <!-- <site site="R:FDP3-P7"/> -->
+          <site site="R:FDP3-P8"/>
+          <site site="R:FDP3-P9"/>
+          <site site="R:FDP3-P10"/>
+        </spatial>
+        <spatial class="music-hand" name="R:FDP2_tendon">
+          <site site="R:FDP2-P1"/>
+          <site site="R:FDP2-P2"/>
+          <geom geom="R:FDP_ellipsoid_wrap" sidesite="R:FDP_ellipsoid_site_FDP2_side"/>
+          <site site="R:FDP2-P3"/>
+          <site site="R:FDP2-P4"/>
+          <site site="R:FDP2-P5"/>
+          <geom geom="R:2ndmcp_ellipsoid_wrap" sidesite="R:2ndmcp_ellipsoid_site_FDP2_side"/>
+          <site site="R:FDP2-P6"/>
+          <site site="R:FDP2-P7"/>
+          <site site="R:FDP2-P8"/>
+          <site site="R:FDP2-P9"/>
+          <site site="R:FDP2-P10"/>
+        </spatial>
+        <spatial class="music-hand" name="R:EDC5_tendon">
+          <site site="R:EDC5-P1"/>
+          <site site="R:EDC5-P2"/>
+          <site site="R:EDC5-P3"/>
+          <geom geom="R:EDCL_torus_wrap" sidesite="R:EDCL_torus_site_EDC5_side"/>
+          <site site="R:EDC5-P4"/>
+          <geom geom="R:5thmcp_ellipsoid_wrap" sidesite="R:5thmcp_ellipsoid_site_EDC5_side"/>
+          <site site="R:EDC5-P5"/>
+          <site site="R:EDC5-P6"/>
+          <geom geom="R:Fifthpm_wrap" sidesite="R:Fifthpm_site_EDC5_side"/>
+          <site site="R:EDC5-P7"/>
+          <site site="R:EDC5-P8"/>
+          <geom geom="R:Fifthmd_wrap" sidesite="R:Fifthmd_site_EDC5_side"/>
+          <site site="R:EDC5-P9"/>
+        </spatial>
+        <spatial class="music-hand" name="R:EDC4_tendon">
+          <site site="R:EDC4-P1"/>
+          <site site="R:EDC4-P2"/>
+          <site site="R:EDC4-P3"/>
+          <geom geom="R:EDCR_torus_wrap" sidesite="R:EDCR_torus_site_EDC4_side"/>
+          <site site="R:EDC4-P4"/>
+          <geom geom="R:4thmcp_ellipsoid_wrap" sidesite="R:4thmcp_ellipsoid_site_EDC4_side"/>
+          <site site="R:EDC4-P5"/>
+          <site site="R:EDC4-P6"/>
+          <geom geom="R:Fourthpm_wrap" sidesite="R:Fourthpm_site_EDC4_side"/>
+          <site site="R:EDC4-P7"/>
+          <site site="R:EDC4-P8"/>
+          <geom geom="R:Fourthmd_wrap" sidesite="R:Fourthmd_site_EDC4_side"/>
+          <site site="R:EDC4-P9"/>
+        </spatial>
+        <spatial class="music-hand" name="R:EDC3_tendon">
+          <site site="R:EDC3-P1"/>
+          <site site="R:EDC3-P2"/>
+          <site site="R:EDC3-P3"/>
+          <geom geom="R:EDCM_torus_wrap" sidesite="R:EDCM_torus_site_EDC3_side"/>
+          <site site="R:EDC3-P4"/>
+          <geom geom="R:3rdmcp_ellipsoid_wrap" sidesite="R:3rdmcp_ellipsoid_site_EDC3_side"/>
+          <site site="R:EDC3-P5"/>
+          <site site="R:EDC3-P6"/>
+          <geom geom="R:Thirdpm_wrap" sidesite="R:Thirdpm_site_EDC3_side"/>
+          <site site="R:EDC3-P7"/>
+          <site site="R:EDC3-P8"/>
+          <geom geom="R:Thirdmd_wrap" sidesite="R:Thirdmd_site_EDC3_side"/>
+          <site site="R:EDC3-P9"/>
+        </spatial>
+        <spatial class="music-hand" name="R:EDC2_tendon">
+          <site site="R:EDC2-P1"/>
+          <site site="R:EDC2-P2"/>
+          <site site="R:EDC2-P3"/>
+          <geom geom="R:EDCI_torus_wrap" sidesite="R:EDCI_torus_site_EDC2_side"/>
+          <site site="R:EDC2-P4"/>
+          <geom geom="R:2ndmcp_ellipsoid_wrap" sidesite="R:2ndmcp_ellipsoid_site_EDC2_side"/>
+          <site site="R:EDC2-P5"/>
+          <site site="R:EDC2-P6"/>
+          <geom geom="R:Secondpm_wrap" sidesite="R:Secondpm_site_EDC2_side"/>
+          <site site="R:EDC2-P7"/>
+          <site site="R:EDC2-P8"/>
+          <geom geom="R:Secondmd_wrap" sidesite="R:Secondmd_site_EDC2_side"/>
+          <site site="R:EDC2-P9"/>
+        </spatial>
+        <spatial class="music-hand" name="R:EDM_tendon">
+          <site site="R:EDM-P1"/>
+          <site site="R:EDM-P2"/>
+          <site site="R:EDM-P3"/>
+          <site site="R:EDM-P4"/>
+          <geom geom="R:EDM_ellipsoid_wrap" sidesite="R:EDM_ellipsoid_site_EDM_side"/>
+          <site site="R:EDM-P5"/>
+          <site site="R:EDM-P6"/>
+          <geom geom="R:5thmcp_ellipsoid_wrap" sidesite="R:5thmcp_ellipsoid_site_EDC5_side"/>
+          <site site="R:EDM-P7"/>
+          <geom geom="R:Fifthpm_wrap"/>
+          <site site="R:EDM-P8"/>
+          <geom geom="R:Fifthmd_wrap" sidesite="R:Fifthmd_site_EDC5_side"/>
+          <site site="R:EDM-P9"/>
+        </spatial>
+        <spatial class="music-hand" name="R:EIP_tendon">
+          <site site="R:EIP-P1"/>
+          <site site="R:EIP-P2"/>
+          <site site="R:EIP-P3"/>
+          <geom geom="R:ExtensorEllipse_ellipsoid_wrap" sidesite="R:ExtensorEllipse_ellipsoid_site_EIP_side"/>
+          <site site="R:EIP-P4"/>
+          <site site="R:EIP-P5"/>
+          <geom geom="R:2ndmcp_ellipsoid_wrap" sidesite="R:2ndmcp_ellipsoid_site_EIP_side"/>
+          <site site="R:EIP-P6"/>
+          <site site="R:EIP-P7"/>
+          <geom geom="R:Secondpm_wrap" sidesite="R:Secondpm_site_EIP_side"/>
+          <site site="R:EIP-P8"/>
+          <site site="R:EIP-P9"/>
+          <geom geom="R:Secondmd_wrap" sidesite="R:Secondmd_site_EIP_side"/>
+          <site site="R:EIP-P10"/>
+          <site site="R:EIP-P11"/>
+        </spatial>
+        <spatial class="music-hand" name="R:EPL_tendon" springlength="0.2305">
+          <site site="R:EPL-P1"/>
+          <site site="R:EPL-P2"/>
+          <site site="R:EPL-P3"/>
+          <site site="R:EPL-P4"/>
+          <site site="R:EPL-P5"/>
+          <site site="R:EPL-P6"/>
+          <site site="R:EPL-P7"/>
+          <site site="R:EPL-P8"/>
+          <site site="R:EPL-P9"/>
+          <geom geom="R:MPthumb_wrap"/>
+          <site site="R:EPL-P10"/>
+          <site site="R:EPL-P11"/>
+          <geom geom="R:IPthumb_wrap" sidesite="R:IPthumb_site_EPL_side"/>
+          <site site="R:EPL-P12"/>
+        </spatial>
+        <spatial class="music-hand" name="R:EPB_tendon">
+          <site site="R:EPB-P1"/>
+          <site site="R:EPB-P2"/>
+          <site site="R:EPB-P3"/>
+          <site site="R:EPB-P4"/>
+          <site site="R:EPB-P5"/>
+          <site site="R:EPB-P6"/>
+          <site site="R:EPB-P7"/>
+          <geom geom="R:MPthumb_wrap" sidesite="R:MPthumb_site_EPB_side"/>
+          <site site="R:EPB-P8"/>
+        </spatial>
+        <spatial class="music-hand" name="R:FPL_tendon">
+          <site site="R:FPL-P1"/>
+          <site site="R:FPL-P2"/>
+          <site site="R:FPL-P3"/>
+          <site site="R:FPL-P4"/>
+          <site site="R:FPL-P5"/>
+          <geom geom="R:FPL_ellipsoid_wrap"/>
+          <site site="R:FPL-P7"/>
+          <site site="R:FPL-P8"/>
+          <geom geom="R:MPthumb_wrap" sidesite="R:MPthumb_site_FPL_side"/>
+          <site site="R:FPL-P9"/>
+          <site site="R:FPL-P10"/>
+          <geom geom="R:IPthumb_wrap" sidesite="R:IPthumb_site_FPL_side"/>
+          <site site="R:FPL-P11"/>
+        </spatial>
+        <spatial class="music-hand" name="R:APL_tendon">
+          <site site="R:APL-P1"/>
+          <site site="R:APL-P2"/>
+          <site site="R:APL-P3"/>
+          <site site="R:APL-P4"/>
+          <site site="R:APL-P5"/>
+          <!-- <geom geom="R:APL_torus_wrap" sidesite="R:APL_torus_site_APL_side"/> -->
+          <site site="R:APL-P6"/>
+          <site site="R:APL-P7"/>
+          <site site="R:APL-P8"/>
+        </spatial>
+        <spatial class="music-hand" name="R:OP_tendon">
+          <site site="R:OP-P1"/>
+          <site site="R:OP-P2"/>
+        </spatial>
+        <!-- MUSIC-Hand Added Tendon Property Start-->
+        <spatial class="music-hand" name="R:FPB_tendon">
+          <site site="R:FPB-P1"/>
+          <site site="R:FPB-P2"/>
+          <site site="R:FPB-P3"/>
+        </spatial>
+        <spatial class="music-hand" name="R:AdP_tendon">
+          <site site="R:AdP-P1"/>
+          <site site="R:AdP-P2"/>
+        </spatial>
+        <spatial class="music-hand" name="R:APB_tendon">
+          <site site="R:APB-P1"/>
+          <site site="R:APB-P2"/>
+          <site site="R:APB-P3"/>
+        </spatial>
+        <spatial class="music-hand" name="R:FDM_tendon">
+          <site site="R:FDM-P1"/>
+          <site site="R:FDM-P2"/>
+        </spatial>
+        <spatial class="music-hand" name="R:ADM_tendon">
+          <site site="R:ADM-P1"/>
+          <site site="R:ADM-P2"/>
+        </spatial>
+        <!-- MUSIC-Hand Added Tendon Property End-->
+        <spatial class="music-hand" name="R:RI2_tendon">
+          <site site="R:RI2-P1"/>
+          <site site="R:RI2-P2"/>
+          <geom geom="R:2ndmcp_ellipsoid_wrap" sidesite="R:2ndmcp_ellipsoid_site_RI2_side"/>
+          <site site="R:RI2-P3"/>
+        </spatial>
+        <spatial class="music-hand" name="R:LU_RB2_tendon">
+          <site site="R:LU_RB2-P1"/>
+          <site site="R:LU_RB2-P2"/>
+          <site site="R:LU_RB2-P3"/>
+          <site site="R:LU_RB2-P4"/>
+          <geom geom="R:Secondpm_wrap" sidesite="R:Secondpm_site_LU_RB2_side"/>
+          <site site="R:LU_RB2-P5"/>
+          <site site="R:LU_RB2-P6"/>
+        </spatial>
+        <spatial class="music-hand" name="R:UI_UB2_tendon">
+          <site site="R:UI_UB2-P1"/>
+          <site site="R:UI_UB2-P2"/>
+          <site site="R:UI_UB2-P3"/>
+          <site site="R:UI_UB2-P4"/>
+          <geom geom="R:Secondpm_wrap" sidesite="R:Secondpm_site_UI_UB2_side"/>
+          <site site="R:UI_UB2-P5"/>
+          <site site="R:UI_UB2-P6"/>
+        </spatial>
+        <spatial class="music-hand" name="R:RI3_tendon">
+          <site site="R:RI3-P1"/>
+          <site site="R:RI3-P2"/>
+          <site site="R:RI3-P3"/>
+        </spatial>
+        <spatial class="music-hand" name="R:LU_RB3_tendon">
+          <site site="R:LU_RB3-P1"/>
+          <site site="R:LU_RB3-P2"/>
+          <site site="R:LU_RB3-P3"/>
+          <!-- <geom geom="R:3rdmcp_ellipsoid_wrap" sidesite="R:3rdmcp_ellipsoid_site_LU_RB3_side"/> -->
+          <site site="R:LU_RB3-P4"/>
+          <geom geom="R:Thirdpm_wrap" sidesite="R:Thirdpm_site_LU_RB3_side"/>
+          <site site="R:LU_RB3-P5"/>
+        </spatial>
+        <spatial class="music-hand" name="R:UI_UB3_tendon">
+          <site site="R:UI_UB3-P1"/>
+          <site site="R:UI_UB3-P2"/>
+          <site site="R:UI_UB3-P3"/>
+          <site site="R:UI_UB3-P4"/>
+          <geom geom="R:Thirdpm_wrap" sidesite="R:Thirdpm_site_UI_UB3_side"/>
+          <site site="R:UI_UB3-P5"/>
+        </spatial>
+        <spatial class="music-hand" name="R:RI4_tendon">
+          <site site="R:RI4-P1"/>
+          <site site="R:RI4-P2"/>
+          <site site="R:RI4-P3"/>
+        </spatial>
+        <spatial class="music-hand" name="R:LU_RB4_tendon">
+          <site site="R:LU_RB4-P1"/>
+          <site site="R:LU_RB4-P2"/>
+          <site site="R:LU_RB4-P3"/>
+          <site site="R:LU_RB4-P4"/>
+          <site site="R:LU_RB4-P5"/>
+        </spatial>
+        <spatial class="music-hand" name="R:UI_UB4_tendon">
+          <site site="R:UI_UB4-P1"/>
+          <site site="R:UI_UB4-P2"/>
+          <geom geom="R:4thmcp_ellipsoid_wrap" sidesite="R:4thmcp_ellipsoid_site_UI_UB4_side"/>
+          <site site="R:UI_UB4-P3"/>
+          <site site="R:UI_UB4-P4"/>
+          <geom geom="R:Fourthpm_wrap" sidesite="R:Fourthpm_site_UI_UB4_side"/>
+          <site site="R:UI_UB4-P5"/>
+        </spatial>
+        <spatial class="music-hand" name="R:RI5_tendon">
+          <site site="R:RI5-P1"/>
+          <site site="R:RI5-P2"/>
+          <site site="R:RI5-P3"/>
+        </spatial>
+        <spatial class="music-hand" name="R:LU_RB5_tendon">
+          <site site="R:LU_RB5-P1"/>
+          <site site="R:LU_RB5-P2"/>
+          <geom geom="R:5thmcp_ellipsoid_wrap" sidesite="R:5thmcp_ellipsoid_site_LU_RB5_side"/>
+          <site site="R:LU_RB5-P3"/>
+          <site site="R:LU_RB5-P4"/>
+          <geom geom="R:Fifthpm_wrap" sidesite="R:Fifthpm_site_LU_RB5_side"/>
+          <site site="R:LU_RB5-P5"/>
+        </spatial>
+        <spatial class="music-hand" name="R:UI_UB5_tendon">
+          <site site="R:UI_UB5-P1"/>
+          <site site="R:UI_UB5-P2"/>
+          <geom geom="R:5thmcp_ellipsoid_wrap" sidesite="R:5thmcp_ellipsoid_site_UI_UB5_side"/>
+          <site site="R:UI_UB5-P3"/>
+          <site site="R:UI_UB5-P4"/>
+          <geom geom="R:Fifthpm_wrap" sidesite="R:Fifthpm_site_UI_UB5_side"/>
+          <site site="R:UI_UB5-P5"/>
+        </spatial>
+    </tendon>
+</mujocoinclude>
