@@ -6,6 +6,7 @@ This is the official implementation for _*MUSIC: Learning Muscle-Driven Dexterou
 
 TODO:
 - [x] hand model
+- [x] reference motion (https://huggingface.co/datasets/xupei0610/MUSIC)
 - [ ] training code (joint-driven)
 - [ ] training code (muscle-driven)
 - [ ] pretrained model
