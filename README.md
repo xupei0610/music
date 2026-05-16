@@ -7,7 +7,7 @@ This is the official implementation for _*MUSIC: Learning Muscle-Driven Dexterou
 TODO:
 - [x] hand model
 - [x] reference motion (https://huggingface.co/datasets/xupei0610/MUSIC)
-- [x] training code (joint-driven)
+- [x] code for joint-driven control
     - We provide pretrained models in `pretrained/joint`. To visualize the performance, please run
 
             # Evaluation
@@ -22,5 +22,5 @@ TODO:
 
         Right after the training start, it will read the reference dataset by operning all the files in the `motions` folder. In some OS, the command `ulimit -n 4096` needs to run first, to increase the number of files that can be opened by one process.
 
-- [ ] training code (muscle-driven)
+- [ ] code for muscle-driven control
 - [ ] more pretrained models
