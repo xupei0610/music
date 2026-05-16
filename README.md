@@ -19,7 +19,8 @@ TODO:
 
             # Train
             python main.py cfg/joint.py --note notes/017-1_fingering.txt --ckpt <checkpoint_directory>
-     
+
+        Right after the training start, it will read the reference dataset by operning all the files in the `motions` folder. In some OS, the command `ulimit -n 4096` needs to run first, to increase the number of files that can be opened by one process.
 
 - [ ] training code (muscle-driven)
 - [ ] more pretrained models
