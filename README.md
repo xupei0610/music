@@ -8,6 +8,13 @@ TODO:
 - [x] hand model
 - [x] reference motion (https://huggingface.co/datasets/xupei0610/MUSIC)
 - [x] code for joint-driven control
+    - Dependencies
+
+        - Python 3.13
+        - Mujoco-MJX 3.3.5
+        - Jax 0.4.34
+        - PyTorch 2.6.0
+
     - We provide pretrained models in `pretrained/joint`. To visualize the performance, please run
 
             # Evaluation
@@ -19,6 +26,7 @@ TODO:
 
             # Train
             python main.py cfg/joint.py --note notes/017-1_fingering.txt --ckpt <checkpoint_directory>
+            python main.py cfg/joint.py --note notes/017-1_nofingering.txt --ckpt <checkpoint_directory>
 
         Right after the training start, it will read the reference dataset by operning all the files in the `motions` folder. In some OS, the command `ulimit -n 4096` needs to run first, to increase the number of files that can be opened by one process.
 
