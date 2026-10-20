@@ -63,7 +63,8 @@ training_params = dict(
     save_interval =  20000,
     horizon = 32,
     num_envs = 8192,
-    terminate_reward = 0
+    terminate_reward = 0,
+    reg = 10,   # penalty on action stds at the max_sigma cap (see main.py)
 )
 
 model_params = dict(

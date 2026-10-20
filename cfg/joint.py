@@ -5,7 +5,11 @@ os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = ".2"
 # use `ulimit -n 4096` beforehand to increase the number of files that can be opened by one process
 
 import resource
-resource.setrlimit(resource.RLIMIT_CORE, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
+# Enable core dumps up to what the system allows. An unprivileged process may
+# raise its soft limit only up to the hard limit, so (INF, INF) fails with
+# "not allowed to raise maximum limit" wherever the hard core limit is finite.
+_, _core_hard = resource.getrlimit(resource.RLIMIT_CORE)
+resource.setrlimit(resource.RLIMIT_CORE, (_core_hard, _core_hard))
 
 env_cls = "PianoJointPD"
 env_params = dict(
@@ -104,7 +108,8 @@ training_params = dict(
     save_interval =  20000,
     horizon = 8,
     num_envs = 2048,
-    terminate_reward = -25
+    terminate_reward = -25,
+    reg = 10,   # penalty on action stds at the max_sigma cap (see main.py)
 )
 
 model_params = dict(

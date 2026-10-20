@@ -70,8 +70,29 @@ TRAINING_PARAMS = dict(
     save_interval = None,
     log_interval = 50,
     terminate_reward = -1,
-    control_mode="position"
+    control_mode="position",
+    # Weight of the penalty on action stds at the max_sigma cap. For an action
+    # dimension whose raw log_sigma is at or above the cap, the policy gradient
+    # of its log-probability is stopped and reg * ||sigma|| is added to the
+    # loss. 0 disables it. Needs model_params max_sigma.
+    reg = 0,
 )
+
+
+def ppo_policy_loss(m, pi, a, lp, adv, reg):
+    """PPO clipped loss of one policy, with the optional reg penalty on action stds at the max_sigma cap."""
+    lp_ = pi.log_prob(a)
+    use_reg = reg and m.actor.max_log_sigma is not None
+    if use_reg:
+        mask = m.actor.logit < m.actor.max_log_sigma
+        lp_ = torch.where(mask, lp_, lp_.detach())
+    lp_ = lp_.sum(-1, keepdim=True)
+    ratio = torch.exp(lp_ - lp)
+    clipped_ratio = torch.clamp(ratio, 1.0-0.2, 1.0+0.2)
+    loss = -torch.min(adv*ratio, adv*clipped_ratio).sum(-1).mean()
+    if use_reg:
+        loss = loss + reg*(torch.logical_not(mask)*pi.scale).norm(2, dim=1).mean()
+    return loss
 
 def test(env, model):
     torch.autograd.set_grad_enabled(False)
@@ -97,8 +118,11 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
     else:
         logger = None
     
-    model1 = model[0]
-    model2 = model[1]
+    # model is a ModuleList of two policies for two hands, else one ACModel
+    if isinstance(model, torch.nn.ModuleList):
+        model1, model2 = model[0], model[1]
+    else:
+        model1, model2 = model, None
 
     BATCH_SIZE = training_params.batch_size
     HORIZON = training_params.horizon
@@ -112,6 +136,7 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
     LOG = logger is not None
     SAVE_CKPT = ckpt_dir is not None
     TWO_HANDS = hasattr(env, "two_hands") and env.two_hands
+    REG = training_params.reg
 
     if TWO_HANDS:
         optimizer = torch.optim.Adam([
@@ -134,9 +159,14 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
         ob_seq_len=[]
     )
     multi_critics = env.reward_weights is not None and env.reward_weights.size(-1) > 1
-    reward_weights = env.reward_weights[0]*2
-    reward_weights1 = reward_weights[[0,1,4]]
-    reward_weights2 = reward_weights[[2,3,5]]
+    # value columns of each policy: two hands use [left disc x2, left goal] and
+    # [right disc x2, right goal]; one hand uses all columns
+    n_cols = len(env.discriminators) + env.rew_dim
+    cols1, cols2 = ([0, 1, 4], [2, 3, 5]) if TWO_HANDS else (list(range(n_cols)), None)
+    if env.reward_weights is not None:
+        reward_weights = env.reward_weights[0]*2
+        reward_weights1 = reward_weights[cols1]
+        reward_weights2 = reward_weights[cols2] if TWO_HANDS else None
     if multi_critics:
         rewards = torch.empty((env.n_envs*HORIZON, reward_weights.size(-1)), dtype=torch.float32, device=env.device)
     has_goal_reward = env.rew_dim > 0
@@ -185,7 +215,7 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
             obs, info = env.reset_done()
             seq_len = info["ob_seq_lens"]
 
-            pi1, values1 = model.act(obs, seq_len-1, with_value=True)
+            pi1, values1 = model1.act(obs, seq_len-1, with_value=True)
             actions1 = pi1.sample()
             log_probs1 = pi1.log_prob(actions1).sum(-1, keepdim=True)
             if TWO_HANDS:
@@ -353,7 +383,7 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
                 values1 = values1.view(HORIZON, -1, values1.size(-1))
                 values1_ = values1_.view(HORIZON, -1, values1_.size(-1))
 
-                advantages1 = (rewards_[...,[0,1,4]] - values1).add_(values1_, alpha=GAMMA)
+                advantages1 = (rewards_[...,cols1] - values1).add_(values1_, alpha=GAMMA)
                 for t in reversed(range(HORIZON-1)):
                     # advantages1[t].addcmul_(advantages1[t+1], not_done[t], value=GAMMA_LAMBDA)
                     advantages1[t].add_(advantages1[t+1]*not_done[t], alpha=GAMMA_LAMBDA)
@@ -374,7 +404,7 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
                     values2 = values2.view(HORIZON, -1, values2.size(-1))
                     values2_ = values2_.view(HORIZON, -1, values2_.size(-1))
 
-                    advantages2 = (rewards_[...,[2,3,5]] - values2).add_(values2_, alpha=GAMMA)
+                    advantages2 = (rewards_[...,cols2] - values2).add_(values2_, alpha=GAMMA)
                     for t in reversed(range(HORIZON-1)):
                         # advantages2[t].addcmul_(advantages2[t+1], not_done[t], value=GAMMA_LAMBDA)
                         advantages2[t].add_(advantages2[t+1]*not_done[t], alpha=GAMMA_LAMBDA)
@@ -434,11 +464,7 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
                     end_frame = ob_seq_end_frames[sample]
 
                     pi1_, v1_ = model1(s, end_frame)
-                    lp1_ = pi1_.log_prob(a1)
-                    lp1_ = lp1_.sum(-1, keepdim=True)
-                    ratio = torch.exp(lp1_ - lp1)
-                    clipped_ratio = torch.clamp(ratio, 1.0-0.2, 1.0+0.2)
-                    pg_loss = -torch.min(adv1*ratio, adv1*clipped_ratio).sum(-1).mean()
+                    pg_loss = ppo_policy_loss(model1, pi1_, a1, lp1, adv1, REG)
                     vf_loss = (v1_ - v_t1).square().mean()
 
                     if TWO_HANDS:
@@ -447,11 +473,7 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
                         adv2 = advantages2[sample]
                         v_t2 = returns2[sample]
                         pi2_, v2_ = model2(s, end_frame)
-                        lp2_ = pi2_.log_prob(a2)
-                        lp2_ = lp2_.sum(-1, keepdim=True)
-                        ratio = torch.exp(lp2_ - lp2)
-                        clipped_ratio = torch.clamp(ratio, 1.0-0.2, 1.0+0.2)
-                        pg_loss2 = -torch.min(adv2*ratio, adv2*clipped_ratio).sum(-1).mean()
+                        pg_loss2 = ppo_policy_loss(model2, pi2_, a2, lp2, adv2, REG)
                         vf_loss2 = (v2_ - v_t2).square().mean()
                         pg_loss = pg_loss + pg_loss2
                         vf_loss = vf_loss + vf_loss2
@@ -459,7 +481,8 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
                     loss = pg_loss + 0.5*vf_loss
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(ac1_parameters, 1.0)
-                    torch.nn.utils.clip_grad_norm_(ac2_parameters, 1.0)
+                    if TWO_HANDS:
+                        torch.nn.utils.clip_grad_norm_(ac2_parameters, 1.0)
 
                     optimizer.step()
                     optimizer.zero_grad()

@@ -1,5 +1,13 @@
 from typing import Callable, Optional, Union, List, Dict, Any, Sequence
 import os, pickle
+import resource
+# The reference-motion workers share tensors through file descriptors. With
+# the common soft limit of 1024 open files they fail with "received 0 items
+# of ancdata". Raise the soft limit up to the hard limit (at most 65536).
+_nofile_soft, _nofile_hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+_nofile_want = 65536 if _nofile_hard == resource.RLIM_INFINITY else min(_nofile_hard, 65536)
+if _nofile_soft != resource.RLIM_INFINITY and _nofile_soft < _nofile_want:
+    resource.setrlimit(resource.RLIMIT_NOFILE, (_nofile_want, _nofile_hard))
 os.environ['XLA_FLAGS'] = (
     '--xla_gpu_triton_gemm_any=True '
 )
@@ -1366,7 +1374,9 @@ class PianoBase(ICCGANHumanoid):
 
 
     def prepare_sim(self, opt={}):
-        opt["disableflags"] = 1<<6 + 1<<8 # no gravity, no warmstart
+        # no gravity, no warmstart. (1<<6 + 1<<8 evaluates to 1<<15, which is
+        # mjDSBL_AUTORESET, because + binds tighter than <<.)
+        opt["disableflags"] = int(mujoco.mjtDisableBit.mjDSBL_GRAVITY) | int(mujoco.mjtDisableBit.mjDSBL_WARMSTART)
         opt["gravity"] = [0, 0, 0]
         super().prepare_sim(opt)
         self.origin = torch.empty((self.n_envs, 1, 3), dtype=torch.float, device=self.device)
@@ -2450,7 +2460,9 @@ class MuscleTracking(ICCGANHumanoid):
         return self.n_char_links*7*self.future_horizon
 
     def prepare_sim(self, opt={}):
-        opt["disableflags"] = 1<<6 + 1<<8 # no gravity, no warmstart
+        # no gravity, no warmstart. (1<<6 + 1<<8 evaluates to 1<<15, which is
+        # mjDSBL_AUTORESET, because + binds tighter than <<.)
+        opt["disableflags"] = int(mujoco.mjtDisableBit.mjDSBL_GRAVITY) | int(mujoco.mjtDisableBit.mjDSBL_WARMSTART)
         opt["gravity"] = [0, 0, 0]
         super().prepare_sim(opt)
         self.tracking_motion_ids = torch.zeros((self.n_envs), dtype=torch.int, device=self.device)
