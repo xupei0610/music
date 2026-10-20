@@ -12,9 +12,14 @@ env_params = dict(
     episode_length = 240*5,
     contactable_links = None,
 
+    # mujoco_warp buffers per world. Measured with 2048-4096 envs: ~6 contacts and
+    # at most ~280 constraints per world (38 contacts in the initial pose).
+    nconmax = 64,
+    njmax = 512,
+
     control_policy = [
-        "pretrained/muscle_tracking/muscle_tracking_left",
-        "pretrained/muscle_tracking/muscle_tracking_right"
+        "pretrained/muscle_tracking/muscle_tracking_left.ckpt",
+        "pretrained/muscle_tracking/muscle_tracking_right.ckpt"
     ],
 
     goal_reward_weight = [0.4, 0.4],
@@ -108,7 +113,8 @@ training_params = dict(
     save_interval =  20000,
     horizon = 8,
     num_envs = 1024,
-    terminate_reward = -25
+    terminate_reward = -25,
+    reg = 10,   # penalty on action stds at the max_sigma cap (see main.py)
 )
 
 model_params = dict(

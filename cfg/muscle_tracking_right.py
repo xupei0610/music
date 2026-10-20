@@ -15,6 +15,11 @@ env_params = dict(
     random_init=True,
     future_horizon=4,
 
+    importance_sampling = 20,
+    importance_discount = 0.99,
+    importance_decay = 0.5,
+    importance_scale = 5,
+
     key_link_weights_orient = {
         "R:ulna": .1,
         "R:radius": 0.05,
@@ -55,10 +60,11 @@ env_params = dict(
 
 training_params = dict(
     max_epochs =    200000,
-    save_interval =  20000,
+    save_interval =  500,   # keep ckpt-<epoch> every 500 epochs to roll back to
     horizon = 32,
     num_envs = 8192,
-    terminate_reward = 0
+    terminate_reward = 0,
+    reg = 10,   # penalty on action stds at the max_sigma cap (see main.py)
 )
 
 model_params = dict(

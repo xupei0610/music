@@ -1,24 +1,76 @@
-All notes are extracted from Piano Fingering Dataset (PIG).
-Please refer to the [official website of PIG](https://beam.kisarazu.ac.jp/~saito/research/PianoFingeringDataset/index.html) to learn more about the dataset.
+# Note files
 
+This folder holds the scores that the piano tasks play (`main.py --note <file>`).
+All scores come from the [PIG Piano Fingering Dataset](https://beam.kisarazu.ac.jp/~saito/research/PianoFingeringDataset/index.html).
+Refer to the PIG website for the dataset and its license.
 
-Note files record the keyboard event.
-The first line is used for description and can be anything or simply an empty line.
+## Files
 
-The following lines are organized as:
+Each piece has two versions:
 
-    NoteID  OnsetTime   OffsetTime  Pitch   OnsetVelocity   OffsetVelocity  Channel     Fingering
+| Suffix | Content | Training task |
+|---|---|---|
+| `_fingering.txt` | The PIG fingering: one finger for each note | The policy must press each key with the given finger. |
+| `_hand.txt` | The same notes with no fingering. `Channel` gives the hand of each note. | The policy selects the finger in the given hand. |
 
-For example,
+The pretrained policies in `pretrained/joint_fingering/` and `pretrained/joint_hand/` use the file with the same name.
+For example, `pretrained/joint_hand/052-1_hand.ckpt` plays `notes/052-1_hand.txt`.
+
+| PIG ID | Piece | Length |
+|---|---|---|
+| 017-1 | Mozart, Piano Sonata K. 545 in C major, 1st movement | 23.5 s |
+| 046-1 | Bach, French Suite No. 3, Minuet | 15.7 s |
+| 048-1 | Bach, English Suite No. 2, Prelude | 27.3 s |
+| 052-1 | Mozart, Piano Sonata K. 280 in F major, 2nd movement | 15.9 s |
+| 061-2 | Beethoven, Für Elise | 19.9 s |
+| 070-1 | Beethoven, Piano Sonata No. 23, 2nd movement | 15.6 s |
+| 075-1 | Chopin, Waltz Op. 64 No. 2 | 19.2 s |
+| 087-1 | Debussy, Suite bergamasque, Passepied | 25.8 s |
+| 092-1 | Grieg, Lyric Pieces Op. 38 No. 1 | 16.0 s |
+| 102-1 | Mussorgsky, Pictures at an Exhibition, Bydło | 20.0 s |
+| 117-1 | Brahms, Rhapsody Op. 79 No. 2 | 24.0 s |
+| 119-1 | Joplin, Maple Leaf Rag | 20.0 s |
+| 123-1 | Beethoven, Piano Sonata No. 3, 2nd movement | 16.0 s |
+| 140-1 | Scarlatti, Sonata in A major K. 208 | 14.7 s |
+| 145-1 | Scriabin, Piano Sonata No. 5 | 31.4 s |
+
+## Format
+
+The files use the PIG text format, with one note on each line:
+
+    NoteID  OnsetTime  OffsetTime  Pitch  OnsetVelocity  OffsetVelocity  Channel  Fingering
+
+The fields are separated by tabs or spaces. For example:
 
     0	0.00488284	1.00342	C5	69	80	0	1
 
-defines a key pressing from 0.00488284s to 1.00342s on Key C5 with an onset velocity of 69 and an offset velocity of 80 on channel 0 using finger 1.
+This line presses C5 from 0.00488 s to 1.00342 s with the right thumb.
+The parser skips blank lines and lines that start with `//`, for example the PIG header `//Version: PianoFingering_v170101`.
+Do not put any other text in the file, because the parser reads every other line as a note.
 
-- The `NoteID` is just used for human users and will be ignored when the program parses it.
-- The `Pitch` indicates the key being pressed. The supported pitch names include `A0`, `A#0`, `B0`, `C1`, `C#1`, `D1`, `D#1`, `E1`, `F1`, `F#1`, `G1`, `G#1`, `A1`, `A#1`, `B1`, `C2`, `C#2`, `D2`, `D#2`, `E2`, `F2`, `F#2`, `G2`, `G#2`, `A2`, `A#2`, `B2`, `C3`, `C#3`, `D3`, `D#3`, `E3`, `F3`, `F#3`, `G3`, `G#3`, `A3`, `A#3`, `B3`, `C4`, `C#4`, `D4`, `D#4`, `E4`, `F4`, `F#4`, `G4`, `G#4`, `A4`, `A#4`, `B4`, `C5`, `C#5`, `D5`, `D#5`, `E5`, `F5`, `F#5`, `G5`, `G#5`, `A5`, `A#5`, `B5`, `C6`, `C#6`, `D6`, `D#6`, `E6`, `F6`, `F#6`, `G6`, `G#6`, `A6`, `A#6`, `B6`, `C7`, `C#7`, `D7`, `D#7`, `E7`, `F7`, `F#7`, `G7`, `G#7`, `A7`, `A#7`, `B7`, `C8`, `Bb0`, `Db1`, `Eb1`, `Gb1`, `Ab1`, `Bb1`, `Db2`, `Eb2`, `Gb2`, `Ab2`, `Bb2`, `Db3`, `Eb3`, `Gb3`, `Ab3`, `Bb3`, `Db4`, `Eb4`, `Gb4`, `Ab4`, `Bb4`, `Db5`, `Eb5`, `Gb5`, `Ab5`, `Bb5`, `Db6`, `Eb6`, `Gb6`, `Ab6`, `Bb6`, `Db7`, `Eb7`, `Gb7`, `Ab7`, `Bb7`.
-- `OnsetVelocity` and `OffsetVelocity` are defined as the volume definition in MIDI files, which are integers in the range of [0, 127]. Those values will be ignored, as the program currently does not support velocity control.
-- `Fingering` defines the finger used for key pressing. It is an integer in the range from -5 to -1, representing fingers from the left little finger to the left thumb, and 1 to 5, representing fingers from the right thumb to the right little finger. Specially, we can leave it blank such that the program will use a nearest-finger heuristic during training to decide the fingering by itself. As a comparison, `017-fingering.txt` is from the PIG, which contains detailed fingering information, and `017-1_nofingering.txt` removes all the fingering information.
-- `Channel` helps indicate the hand-level key event assignment when the `Fingering` field is blank. 0 indicates the right hand, and 1 indicates the left hand. A lazy setup could be using 0 for treble clef and 1 for bass clef.
-- It is also allowed that `Channel` and `Fingering` are both blank, which means there is no predefined hand-level key assignment
+| Field | Meaning |
+|---|---|
+| `NoteID` | A label for people. The parser does not use it. |
+| `OnsetTime`, `OffsetTime` | The start and end of the key press, in seconds. |
+| `Pitch` | A note name from `A0` to `C8`. Sharps use `#`, for example `C#4`. The flats `Db`, `Eb`, `Gb`, `Ab` and `Bb` are also accepted. A MIDI note number from 21 to 108 is also accepted. |
+| `OnsetVelocity`, `OffsetVelocity` | MIDI velocities from 0 to 127. The parser does not use them, because the tasks have no velocity control. |
+| `Channel` | The hand: `0` is the right hand and `1` is the left hand. Any other integer, for example `-1`, means "no hand given". |
+| `Fingering` | The finger: `1` to `5` are the right thumb to the right little finger. `-1` to `-5` are the left thumb to the left little finger. |
 
+A line can have 6, 7 or 8 fields:
+
+| Fields | Meaning | During training |
+|---|---|---|
+| 8 | Hand and finger are given. | The reward uses the given finger. |
+| 7 (no `Fingering`) | Only the hand is given. This is the format of the `_hand.txt` files. | The reward uses the nearest finger of the given hand. |
+| 6 (no `Channel`, no `Fingering`) | Nothing is given. | The reward uses the nearest finger of either hand. |
+
+If `Fingering` is not a value from the list above, the parser uses only `Channel` for that note.
+For example, PIG writes a finger change on a held note as `3_1`.
+
+## How the parser converts the times
+
+- It moves the first onset of the file to time 0.
+- It rounds each onset and offset to the nearest control frame. The tasks run at 60 frames per second.
+- It skips a note that is shorter than 3 frames (50 ms) and prints a message.
+- If a note follows another note on the same key with no rest, the parser releases the key for one frame between the two notes. This makes the hand lift the key and press it again.

@@ -1,7 +1,7 @@
 # MUSIC: Learning Muscle-Driven Dexterous Hand Control
 
 This is the official implementation of _MUSIC: Learning Muscle-Driven
-Dexterous Hand Control_.
+Dexterous Hand Control_, on [MuJoCo Warp](https://github.com/google-deepmind/mujoco_warp).
 [[Webpage](https://pei-xu.github.io/music)]
 [[arXiv](https://arxiv.org/abs/2604.23886)]
 [[YouTube](https://youtu.be/tt1D36gE8zM)]
@@ -11,166 +11,237 @@ Dexterous Hand Control_.
 
 MUSIC is a hierarchical control framework for physics-based piano performance
 with anatomically detailed musculoskeletal hands. General single-hand policies
-first learn to track a large motion dataset at 480 Hz using muscle-tendon
+first learn to track a large motion dataset at 480 Hz with muscle-tendon
 actuation. Their motion spaces are distilled into compact variational latent
-spaces, and piece-specific high-level policies coordinate both hands at 60 Hz
-by controlling these latent actions from musical note goals.
+spaces. Piece-specific high-level policies then coordinate both hands at 60 Hz.
+They control these latent actions from musical note goals.
 
-## Code Usage
+## What is new in this version
+
+The first release ran the simulation in MuJoCo MJX with JAX.
+This version runs it in MuJoCo Warp, and it does not need JAX.
+
+- **Simulation:** all environments step together on the GPU in `mujoco_warp`, with CUDA graphs.
+  The code uses the standard MuJoCo collision pipeline, with no custom collision pruning.
+- **Two backends:** `warp` (default) for training on a GPU, and `mujoco` (native MuJoCo on the CPU) for tests, the viewer and audio.
+  A Mac without CUDA can run the viewer with the `mujoco` backend.
+- **Speed:** on one NVIDIA L40S, with 2048 environments and 60 Hz control steps:
+  - The joint-driven piano task runs at about 42,000 control steps per second, or 340,000 physics steps per second.
+  - The muscle-driven piano task with 88 muscle tendons runs at about 25,600 control steps per second.
+    Each control step runs both tracking policies and the physics 8 times at 480 Hz, so the physics runs at about 205,000 steps per second.
+- **Training stability:** a penalty on action standard deviations at the `max_sigma` cap stops a collapse of long training runs.
+  An optional value normalizer (PopArt, `--normalize-value`) is also available.
+- **Audio:** the viewer can play the piano with a sampled piano sound.
+
+## Setup
 
 ### Dependencies
 
-- Python 3.13
-- PyTorch 2.6.0
-- JAX 0.4.34
-- MuJoCo and MuJoCo MJX 3.3.5
+- Python 3.12
+- PyTorch 2.14.1 (CUDA 13 build on Linux)
+- MuJoCo 3.14.0, MuJoCo Warp 3.14.0 and NVIDIA Warp 1.17.0
 
-We recommend using [uv](https://docs.astral.sh/uv/) to install the exact
-dependencies:
+Install them with [uv](https://docs.astral.sh/uv/):
 
 ```bash
-uv sync
+uv sync                    # creates .venv from pyproject.toml
+uv sync --extra audio      # also installs sounddevice for audio in the viewer
 ```
 
-The supplied `pyproject.toml` installs the CUDA 12 build of JAX on Linux and
-the standard JAX build on other platforms. Alternatively, create a Python 3.13
-environment and install the requirements with pip:
+`pyproject.toml` pins the simulation packages and PyTorch to the versions above.
+If your uv user configuration adds a private package index, add `--no-config` to the `uv` commands.
 
-```bash
-python3.13 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-```
-
-All commands below use `uv run`. On macOS, use `uv run mjpython main.py ...`
-instead of `uv run python main.py ...` for evaluation commands that open the
-MuJoCo viewer.
-
-### Data Preparation
+### Reference motions
 
 Download the 651-minute reference motion dataset from
-[Hugging Face](https://huggingface.co/datasets/xupei0610/MUSIC):
+[Hugging Face](https://huggingface.co/datasets/xupei0610/MUSIC), about 8.7 GB:
 
 ```bash
-uvx --from huggingface-hub hf download xupei0610/MUSIC \
-  --repo-type dataset \
-  --local-dir motions
+scripts/download_motions.sh                    # everything -> ./motions
+scripts/download_motions.sh --hand right       # one hand
+scripts/download_motions.sh --files 000 001    # selected clips, both hands
 ```
 
-The resulting directory should have the following layout:
+The script writes to `motions/left_hand_motions/` and `motions/right_hand_motions/`.
+A second run skips the files that are already present.
+The configuration files read the motion list at load time, so training and evaluation both need the dataset.
+
+### Note files
+
+Piano goals are note-event files in `notes/`. Each of the 15 pieces has two versions:
+
+- `<piece>_fingering.txt` gives a finger for each note.
+- `<piece>_hand.txt` gives only the hand for each note, and the policy selects the finger.
+
+See [`notes/README.md`](notes/README.md) for the file format and the list of pieces.
+
+### Pretrained policies
+
+<!-- TODO: add the download link or script for the pretrained policies -->
+
+The pretrained policies go into `pretrained/`:
 
 ```text
-motions/
-  left_hand_motions/
-  right_hand_motions/
+pretrained/
+  joint_fingering/<piece>_fingering.ckpt   # joint-driven, given fingering (15 pieces)
+  joint_hand/<piece>_hand.ckpt             # joint-driven, hand only (15 pieces)
+  muscle_tracking/muscle_tracking_left.ckpt
+  muscle_tracking/muscle_tracking_right.ckpt
 ```
 
-The configuration files enumerate the motion files when they are loaded, so
-the dataset is required for both training and evaluation. On systems with a
-low open-file limit, run the following command before starting:
+> **TODO:** Pretrained high-level muscle-driven piano policies (`cfg/muscle.py`) are not included yet.
+> We will add them in a later update.
 
-```bash
-ulimit -n 4096
-```
+Each file keeps only what running the policy needs: the actor and the observation normalizer.
+A file plays the note file with the same name.
+For example, `pretrained/joint_hand/052-1_hand.ckpt` plays `notes/052-1_hand.txt`.
 
-Piano goals are specified with note-event files. See
-[`notes/README.md`](notes/README.md) for the file format and fingering
-conventions.
+Mean scores of the joint-driven policies over the 15 pieces, one full play of each piece:
 
-### Joint-Driven Piano Control
+| Policies | Frame F1 | Note F1 |
+|---|---|---|
+| `joint_fingering` | 0.990 | 0.983 |
+| `joint_hand` | 0.986 | 0.982 |
 
-To train a piece-specific joint-driven policy:
+Frame F1 compares the pressed keys with the score at each control frame.
+Note F1 matches a played note to a score note on the same key when the onsets are within 50 ms of each other.
+
+## Usage
+
+All commands run from the repository root.
+Use `--device <GPU_ID>` to select a GPU. The default is `0`.
+Training writes its checkpoints and TensorBoard logs to the directory that `--ckpt` gives.
+
+### Joint-driven piano control
+
+Train a piece-specific policy:
 
 ```bash
 uv run python main.py cfg/joint.py \
   --note notes/017-1_fingering.txt \
-  --ckpt <checkpoint_directory>
+  --ckpt runs/joint_017_fingering
 ```
 
-We provide policies trained with and without annotated fingering in
-`pretrained/joint`. Evaluate them with:
+`cfg/joint.py` trains for 25,000 epochs and saves `ckpt-<epoch>` every 5,000 epochs.
+It also updates `ckpt` every 100 epochs.
+
+Evaluate a pretrained policy:
 
 ```bash
 uv run python main.py cfg/joint.py \
   --note notes/017-1_fingering.txt \
-  --ckpt pretrained/joint/joint_017-fingering \
-  --test
-
-uv run python main.py cfg/joint.py \
-  --note notes/017-1_nofingering.txt \
-  --ckpt pretrained/joint/joint_017-nofingering \
+  --ckpt pretrained/joint_fingering/017-1_fingering.ckpt \
   --test
 ```
 
-### Low-Level Muscle Tracking
+### Low-level muscle tracking
 
-The muscle-driven pipeline first trains one general motion-tracking policy for
-each hand:
+Train one general tracking policy for each hand:
+
+```bash
+uv run python main.py cfg/muscle_tracking_left.py  --ckpt runs/muscle_tracking_left
+uv run python main.py cfg/muscle_tracking_right.py --ckpt runs/muscle_tracking_right
+```
+
+Evaluate the pretrained tracking policies:
 
 ```bash
 uv run python main.py cfg/muscle_tracking_left.py \
-  --ckpt <left_checkpoint_directory>
-
+  --ckpt pretrained/muscle_tracking/muscle_tracking_left.ckpt --test
 uv run python main.py cfg/muscle_tracking_right.py \
-  --ckpt <right_checkpoint_directory>
+  --ckpt pretrained/muscle_tracking/muscle_tracking_right.ckpt --test
 ```
 
-Pretrained tracking policies are provided in `pretrained/muscle_tracking`.
-Evaluate them with:
+### High-level muscle-driven piano control
 
-```bash
-uv run python main.py cfg/muscle_tracking_left.py \
-  --ckpt pretrained/muscle_tracking/muscle_tracking_left \
-  --test
-
-uv run python main.py cfg/muscle_tracking_right.py \
-  --ckpt pretrained/muscle_tracking/muscle_tracking_right \
-  --test
-```
-
-### High-Level Muscle-Driven Piano Control
-
-`cfg/muscle.py` trains the piece-specific high-level policy that coordinates
-the two low-level muscle controllers. By default, the configuration loads:
-
-```text
-pretrained/muscle_tracking/muscle_tracking_left
-pretrained/muscle_tracking/muscle_tracking_right
-```
-
-Train a high-level muscle-driven policy with:
+`cfg/muscle.py` trains a piece-specific high-level policy that coordinates the two tracking policies.
+By default, it loads `pretrained/muscle_tracking/muscle_tracking_{left,right}.ckpt`.
 
 ```bash
 uv run python main.py cfg/muscle.py \
   --note notes/017-1_fingering.txt \
-  --ckpt <checkpoint_directory>
+  --ckpt runs/muscle_017_fingering
 ```
 
-Evaluate the trained policy with the same configuration and note file:
+Evaluate it with the same configuration and note file, and add `--test`.
+
+> **TODO:** Pretrained high-level muscle-driven piano policies (`cfg/muscle.py`) are not included yet.
+> We will add them in a later update.
+
+### Continue a training run
+
+Repeat the training command and add `--resume`.
+Training then continues from the latest `ckpt` in that directory.
 
 ```bash
 uv run python main.py cfg/muscle.py \
   --note notes/017-1_fingering.txt \
-  --ckpt <checkpoint_directory> \
-  --test
-```
-
-Use `--device <GPU_ID>` to select a GPU; the default is `0`. Pass
-`--device cpu` to run on the CPU. To continue training from the latest
-checkpoint in an existing directory, repeat the training command with
-`--resume`:
-
-```bash
-uv run python main.py cfg/muscle.py \
-  --note notes/017-1_fingering.txt \
-  --ckpt <checkpoint_directory> \
+  --ckpt runs/muscle_017_fingering \
   --resume
 ```
 
-Training checkpoints and TensorBoard logs are written to the directory passed
-to `--ckpt`.
+A run that used `--normalize-value` needs this option again for `--resume` and `--test`.
 
-## Data Attribution
+## Viewer and audio
+
+`--test` opens the MuJoCo viewer and plays the policy in real time.
+The viewer needs a display. On a remote host, use `ssh -X` or VNC.
+Press **P** to pause and resume.
+
+To run the viewer with audio on the CPU, use the native MuJoCo backend:
+
+```bash
+uv sync --extra audio
+uv run python main.py cfg/joint.py --backend mujoco --device cpu --test \
+  --note notes/046-1_fingering.txt \
+  --ckpt pretrained/joint_fingering/046-1_fingering.ckpt
+```
+
+On macOS, the viewer needs `mjpython`. Use `scripts/mjpython.sh` in place of `uv run python`:
+
+```bash
+scripts/mjpython.sh main.py cfg/joint.py --backend mujoco --device cpu --test \
+  --note notes/046-1_fingering.txt \
+  --ckpt pretrained/joint_fingering/046-1_fingering.ckpt
+```
+
+The script sets `DYLD_FALLBACK_LIBRARY_PATH`.
+Without it, `mjpython` cannot find the `libpython3.12.dylib` of the Python that uv installs.
+
+## Repository layout
+
+```text
+main.py                # training and evaluation entry point
+env.py                 # tasks: PianoJointPD, PianoMuscleDriven, MuscleTracking
+sim/                   # simulators: warp_sim.py (mujoco_warp) and mujoco_sim.py (native MuJoCo)
+models.py              # actor-critic, discriminator, observation and value normalizers
+mujoco_warp_patch.py   # float32 fix for the inside-wrap tendon computation of mujoco_warp
+ref_motion.py          # reference motion loader
+piano_audio.py         # piano audio for the viewer
+utils.py               # quaternion helpers
+cfg/                   # configuration files
+assets/                # hand, arm and piano models
+notes/                 # note-event files
+scripts/               # motion download and the macOS viewer wrapper
+```
+
+## Troubleshooting
+
+- **`nefc overflow` or `broadphase overflow`:** a world has more contacts or constraints than its buffer holds.
+  Increase `nconmax` or `njmax` in the `env_params` of the configuration.
+  These sizes are per world, so the memory grows with the number of environments.
+- **Too many open files:** at import, `env.py` raises the open-file limit to 65,536 or to the hard limit, whichever is lower.
+  If your hard limit is lower than that, increase it before you start.
+- **`BrokenPipeError` from the reference-motion queue:** a sampling process stopped.
+  The error message gives the exit code of the queue manager and of each sampling worker.
+  A negative code `-N` means that signal `N` stopped the process.
+
+## License
+
+The code is released under the [MIT License](LICENSE).
+The source datasets keep their own licenses. See the data attribution below.
+
+## Data attribution
 
 The reference motions are retargeted from the
 [ForElise](https://for-elise.github.io/) piano performance dataset. The note
@@ -180,7 +251,7 @@ Please follow the licenses and citation requirements of the source datasets.
 
 ## Citation
 
-If you use this code, the hand model, or the provided motion data, please cite:
+If you use this code, the hand model or the motion data, please cite:
 
 ```bibtex
 @article{music,

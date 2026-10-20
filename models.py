@@ -54,35 +54,36 @@ class DiagonalPopArt(torch.nn.Module):
         self.weight = weight
         self.bias = bias
 
+    def _stats(self, m, v, debias):
+        # m and v are exponential moving averages of x and x^2 that start
+        # at 0. Dividing by debias removes that start-up bias. Use the
+        # debiased values for both the mean and the variance.
+        debias = debias.clip(min=self.epsilon)
+        mean = m / debias
+        var = (v / debias - mean.square()).clip_(min=self.epsilon)
+        return mean, var.sqrt_()
+
     def forward(self, x, unnorm=False):
-        debias = self.debias.clip(min=self.epsilon)
-        mean = self.m/debias
-        var = (self.v - self.m.square()).div_(debias)
+        mean, std = self._stats(self.m, self.v, self.debias)
         if unnorm:
-            std = torch.sqrt(var)
             return (mean + std * x).to(x.dtype)
-        x = ((x - mean) * torch.rsqrt(var)).to(x.dtype)
-        return x
+        return ((x - mean) / std).to(x.dtype)
 
     @torch.no_grad()
     def update(self, x):
-        x = x.view(-1, x.size(-1))
-        running_m = torch.mean(x, dim=0)
-        running_v = torch.mean(x.square(), dim=0)
-        new_m = self.m.mul(1-self.momentum).add_(running_m, alpha=self.momentum)
-        new_v = self.v.mul(1-self.momentum).add_(running_v, alpha=self.momentum)
-        std = (self.v - self.m.square()).sqrt_()
-        new_std_inv = (new_v - new_m.square()).rsqrt_()
+        x = x.view(-1, x.size(-1)).to(self.m.dtype)
+        old_mean, old_std = self._stats(self.m, self.v, self.debias)
+        self.m.mul_(1-self.momentum).add_(x.mean(0), alpha=self.momentum)
+        self.v.mul_(1-self.momentum).add_(x.square().mean(0), alpha=self.momentum)
+        self.debias.mul_(1-self.momentum).add_(self.momentum)
+        new_mean, new_std = self._stats(self.m, self.v, self.debias)
 
-        scale = std.mul_(new_std_inv)
-        shift = (self.m - new_m).mul_(new_std_inv)
-
-        self.bias.data.mul_(scale).add_(shift)
-        self.weight.data.mul_(scale.unsqueeze_(-1))
-
-        self.debias.data.mul_(1-self.momentum).add_(1.0*self.momentum)
-        self.m.data.copy_(new_m)
-        self.v.data.copy_(new_v)
+        # Rescale the output layer so that the unnormalized output
+        # (mean + std * layer(h)) stays the same under the new statistics.
+        scale = old_std / new_std
+        shift = (old_mean - new_mean) / new_std
+        self.weight.data.mul_(scale.unsqueeze(-1).to(self.weight.dtype))
+        self.bias.data.mul_(scale.to(self.bias.dtype)).add_(shift.to(self.bias.dtype))
 
 
 class Discriminator(torch.nn.Module):
@@ -274,6 +275,9 @@ class ACModel(torch.nn.Module):
             
             mu = self.mu(latent)
             log_sigma = self.log_sigma(latent)
+
+            self.logit = log_sigma
+
             if self.max_log_sigma is not None:
                 log_sigma = log_sigma + ((log_sigma>self.max_log_sigma)*(self.max_log_sigma-log_sigma)).detach_()
             sigma = torch.log(1+torch.exp(log_sigma)) + 1e-6

@@ -1,23 +1,40 @@
 [project]
-name = "music"
-version = "1.0.0"
-description = "Learning muscle-driven dexterous hand control."
+name = "muscle-warp"
+version = "0.1.0"
+description = "Muscle-driven hand/arm control (MUSIC) ported from MuJoCo MJX to MuJoCo Warp."
 readme = "README.md"
-requires-python = ">=3.13,<3.14"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12,<3.13"
 dependencies = [
-    "jax[cuda12]==0.4.34; sys_platform == 'linux'",
-    "jax==0.4.34; sys_platform != 'linux'",
+    # simulation stack: pinned to the versions the env was validated with
+    "mujoco==3.14.0",
+    "mujoco-warp==3.14.0",
+    "warp-lang==1.17.0",
+    "torch==2.14.1",
     "joblib>=1.4",
     "matplotlib>=3.10",
-    "mujoco==3.3.5",
-    "mujoco-mjx==3.3.5",
     "numpy>=2.0",
     "pyyaml>=6.0",
     "scipy>=1.15",
-    "sounddevice>=0.5",
     "tensorboard>=2.20",
-    "torch==2.6.0",
+]
+
+[project.optional-dependencies]
+# real-time piano audio in the viewer (piano_audio.py)
+audio = ["sounddevice>=0.5"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "absl-py>=2",
 ]
 
 [tool.uv]
 package = false
+
+# Resolve from public PyPI so uv.lock carries public URLs only.
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true

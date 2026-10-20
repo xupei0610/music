@@ -60,10 +60,11 @@ env_params = dict(
 
 training_params = dict(
     max_epochs =    200000,
-    save_interval =  20000,
+    save_interval =  500,   # keep ckpt-<epoch> every 500 epochs to roll back to
     horizon = 32,
     num_envs = 8192,
-    terminate_reward = 0
+    terminate_reward = 0,
+    reg = 10,   # penalty on action stds at the max_sigma cap (see main.py)
 )
 
 model_params = dict(

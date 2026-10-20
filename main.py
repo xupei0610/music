@@ -16,23 +16,38 @@ parser.add_argument("config", type=str,
     help="Configure file used for training. Please refer to files in `config` folder.")
 parser.add_argument("--note", nargs="+", type=str, default=None,
     help="Note file.")
+parser.add_argument("--character", nargs="+", type=str, default=None,
+    help="One or more MJCF paths used as the character model. Overrides "
+         "the config's `character_model`. Several paths are merged into "
+         "one model, for example a hand model and the include-files of "
+         "scene objects.")
+parser.add_argument("--motion", type=str, default=None,
+    help="Motion file path. Overrides the config's `motion_file`.")
 parser.add_argument("--ckpt", type=str, default=None,
     help="Checkpoint directory or file for training or evaluation.")
 parser.add_argument("--test", action="store_true", default=False,
     help="Run visual evaluation.")
 parser.add_argument("--seed", type=int, default=42,
     help="Random seed.")
+parser.add_argument("--backend", choices=["warp", "mujoco"], default=None,
+    help="Simulator: warp (mujoco_warp, default) or mujoco (native MuJoCo on the CPU, "
+         "for tests and the viewer). Overrides the config's `backend`.")
 parser.add_argument("--device", type=str, default="0",
     help="ID of the target GPU device for model running or CPU.")
 
+
 parser.add_argument("--silent", action="store_true", default=False)
 parser.add_argument("--resume", action="store_true", default=False)
+parser.add_argument("--normalize-value", action="store_true", default=False,
+    help="Normalize the critic's value targets with PopArt (sets model_params "
+         "normalize_value=True). A checkpoint trained with it has value_normalizer "
+         "entries, so --resume and --test with that checkpoint also need this option.")
 
 settings = parser.parse_args()
 
 def get_rng_state(device):
     return (
-        torch.get_rng_state(), 
+        torch.get_rng_state(),
         torch.cuda.get_rng_state(device) if torch.cuda.is_available and "cuda" in str(device) else None,
         np.random.get_state(),
         random.getstate(),
@@ -44,7 +59,7 @@ def set_rng_state(state, device):
         torch.cuda.set_rng_state(state[1], device)
     np.random.set_state(state[2])
     random.setstate(state[3])
-    
+
 os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
 os.environ['PYTHONHASHSEED'] = str(settings.seed)
 np.random.seed(settings.seed)
@@ -70,25 +85,53 @@ TRAINING_PARAMS = dict(
     save_interval = None,
     log_interval = 50,
     terminate_reward = -1,
-    control_mode="position"
+    control_mode="position",
+    # Weight of the penalty on action stds at the max_sigma cap. For an action
+    # dimension whose raw log_sigma is at or above the cap, the policy gradient
+    # of its log-probability is stopped and reg * ||sigma|| is added to the
+    # loss. 0 disables it. Needs model_params max_sigma.
+    reg = 0,
 )
+
+def policy_models(env, model):
+    """The per-hand policies: [model] for one hand, [left, right] for two."""
+    if getattr(env, "two_hands", False):
+        return [model[0], model[1]]
+    return [model]
+
+
+def value_columns(env):
+    """Reward/value columns each policy is trained on, or [None] (all columns).
+
+    Reward layout (env.reward_weights): one column per discriminator, ordered by
+    DiscriminatorConfig.id, followed by env.rew_dim task rewards. With two
+    hands the first half of the discriminators and task reward 0 belong to the
+    left policy, the second half and task reward 1 to the right one.
+    """
+    if not getattr(env, "two_hands", False):
+        return [None]
+    n_disc = len(env.discriminators)
+    assert n_disc % 2 == 0 and env.rew_dim == 2, \
+        "two-hand training needs an even number of discriminators and 2 task rewards, got {} and {}".format(n_disc, env.rew_dim)
+    for disc in env.discriminators.values():
+        prefix = "L:" if disc.id < n_disc // 2 else "R:"
+        names = [env.mj_model.body(lid + 1).name for lid in (disc.key_links or [])]
+        assert all(n.startswith(prefix) for n in names), \
+            "discriminator {} (id {}) must observe only {} links: {}".format(disc.name, disc.id, prefix, names)
+    return [list(range(n_disc // 2)) + [n_disc], list(range(n_disc // 2, n_disc)) + [n_disc + 1]]
+
 
 def test(env, model):
     torch.autograd.set_grad_enabled(False)
     model.eval()
     env.eval()
     env.reset()
+    models = policy_models(env, model)
     while not env.request_quit:
         obs, info = env.reset_done()
         seq_len = info["ob_seq_lens"]
-        if hasattr(env, "two_hands") and env.two_hands:
-            pi1 = model1.act(obs, seq_len-1)
-            pi2 = model2.act(obs, seq_len-1)
-            actions = (pi1.mean, pi2.mean)
-        else:
-            pi = model.act(obs, seq_len-1)
-            actions = pi.mean
-        env.step(actions)
+        actions = tuple(m.act(obs, seq_len-1).mean for m in models)
+        env.step(actions if len(actions) > 1 else actions[0])
 
 
 def train(env, model, ckpt_dir, training_params, ckpt=None):
@@ -96,9 +139,6 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
         logger = SummaryWriter(ckpt_dir)
     else:
         logger = None
-    
-    model1 = model[0]
-    model2 = model[1]
 
     BATCH_SIZE = training_params.batch_size
     HORIZON = training_params.horizon
@@ -111,34 +151,32 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
     N_ENVS = env.n_envs
     LOG = logger is not None
     SAVE_CKPT = ckpt_dir is not None
-    TWO_HANDS = hasattr(env, "two_hands") and env.two_hands
 
-    if TWO_HANDS:
-        optimizer = torch.optim.Adam([
-            {"params": list(model1.actor.parameters())+list(model2.actor.parameters()), "lr": training_params.actor_lr},
-            {"params": list(model1.critic.parameters())+list(model2.critic.parameters()), "lr": training_params.critic_lr}
-        ])
-        ac1_parameters = list(model1.actor.parameters()) + list(model1.critic.parameters())
-        ac2_parameters = list(model2.actor.parameters()) + list(model2.critic.parameters())
-    else:
-        optimizer = torch.optim.Adam([
-            {"params": list(model.actor.parameters()), "lr": training_params.actor_lr},
-            {"params": list(model.critic.parameters()), "lr": training_params.critic_lr}
-        ])
-        ac1_parameters = list(model1.actor.parameters()) + list(model1.critic.parameters())
+    REG = training_params.reg
+
+    models = policy_models(env, model)
+    cols = value_columns(env)
+    N_POLICIES = len(models)
+
+    optimizer = torch.optim.Adam([
+        {"params": [p for m in models for p in m.actor.parameters()], "lr": training_params.actor_lr},
+        {"params": [p for m in models for p in m.critic.parameters()], "lr": training_params.critic_lr}
+    ])
+    ac_parameters = [list(m.actor.parameters()) + list(m.critic.parameters()) for m in models]
 
     disc_optimizer = {name: torch.optim.Adam(disc.parameters(), training_params.disc_lr) for name, disc in model.discriminators.items()}
 
-    buffer = dict(
-        s=[], a1=[], a2=[], v1=[], v2=[], lp1=[], lp2=[], v1_=[], v2_=[], not_done=[], terminate=[],
-        ob_seq_len=[]
-    )
+    buffer = dict(s=[], not_done=[], terminate=[], ob_seq_len=[])
+    for k in ("a", "v", "lp", "v_"):
+        buffer[k] = [[] for _ in models]
     multi_critics = env.reward_weights is not None and env.reward_weights.size(-1) > 1
-    reward_weights = env.reward_weights[0]*2
-    reward_weights1 = reward_weights[[0,1,4]]
-    reward_weights2 = reward_weights[[2,3,5]]
     if multi_critics:
+        # each policy's weights sum to the same total as a single policy's
+        reward_weights = env.reward_weights[0] * N_POLICIES
+        # every column is written each horizon: discriminator columns by
+        # DiscriminatorConfig.id, task rewards in the last env.rew_dim columns
         rewards = torch.empty((env.n_envs*HORIZON, reward_weights.size(-1)), dtype=torch.float32, device=env.device)
+        assert len(env.discriminators) + env.rew_dim == rewards.size(-1)
     has_goal_reward = env.rew_dim > 0
     if has_goal_reward:
         buffer["r"] = []
@@ -147,7 +185,7 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
         name: dict(fake=[], real=[]) for name in env.discriminators.keys()
     }
     real_losses, fake_losses = {n:[] for n in buffer_disc.keys()}, {n:[] for n in buffer_disc.keys()}
-    
+
 
     epoch = 0
     if ckpt is not None and os.path.exists(settings.ckpt):
@@ -168,13 +206,9 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
             epoch = state_dict["epoch"]
             if "average_reward" in state_dict:
                 env.average_reward = state_dict["average_reward"]
-            # if "tracking_motion_samples" in state_dict:
-            #     env.tracking_motion_samples = state_dict["tracking_motion_samples"]
-            # if "track_note_samples" in state_dict:
-            #     env.track_note_samples = state_dict["track_note_samples"]
-    
+
     performance = {k:[] for k in env.info["log"].keys()}
-    
+
     model.eval()
     env.train()
     env.reset()
@@ -185,16 +219,14 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
             obs, info = env.reset_done()
             seq_len = info["ob_seq_lens"]
 
-            pi1, values1 = model.act(obs, seq_len-1, with_value=True)
-            actions1 = pi1.sample()
-            log_probs1 = pi1.log_prob(actions1).sum(-1, keepdim=True)
-            if TWO_HANDS:
-                pi2, values2 = model2.act(obs, seq_len-1, with_value=True)
-                actions2 = pi2.sample()
-                log_probs2 = pi2.log_prob(actions2).sum(-1, keepdim=True)
-                actions = actions1, actions2
-            else:
-                actions = actions1
+            step_actions, step_values, step_log_probs = [], [], []
+            for m in models:
+                pi, values = m.act(obs, seq_len-1, with_value=True)
+                a = pi.sample()
+                step_actions.append(a)
+                step_values.append(values)
+                step_log_probs.append(pi.log_prob(a).sum(-1, keepdim=True))
+            actions = tuple(step_actions) if N_POLICIES > 1 else step_actions[0]
 
             obs_, rews, dones, info = env.step(actions)
 
@@ -211,7 +243,7 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
                 masked = True
 
             not_done = (~dones).unsqueeze_(-1)
-            
+
             if env.discriminators:
                 fakes = info["disc_obs"]
                 reals = info["disc_obs_expert"]
@@ -219,24 +251,18 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
                     for n, d in fakes.items():
                         d[mask, -1] = 0
 
-            values1_ = model1.evaluate(obs_, seq_len)
-            if TWO_HANDS:
-                values2_ = model2.evaluate(obs_, seq_len)
+            step_values_ = [m.evaluate(obs_, seq_len) for m in models]
 
             info_log = info["log"]
             for k, v in performance.items():
                 v.append(info_log[k].mean().item())
-                  
+
         buffer["s"].append(obs)
-        buffer["a1"].append(actions1)
-        buffer["lp1"].append(log_probs1)
-        buffer["v1"].append(values1)
-        buffer["v1_"].append(values1_)
-        if TWO_HANDS:
-            buffer["a2"].append(actions2)
-            buffer["lp2"].append(log_probs2)
-            buffer["v2"].append(values2)
-            buffer["v2_"].append(values2_)
+        for i in range(N_POLICIES):
+            buffer["a"][i].append(step_actions[i])
+            buffer["lp"][i].append(step_log_probs[i])
+            buffer["v"][i].append(step_values[i])
+            buffer["v_"][i].append(step_values_[i])
         buffer["not_done"].append(not_done)
         buffer["terminate"].append(terminate)
         buffer["ob_seq_len"].append(seq_len)
@@ -259,7 +285,7 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
                         real_ = torch.cat(data["real"])
                         end_frame = ob_seq_lens # N
 
-                        length = torch.arange(fake.size(1), 
+                        length = torch.arange(fake.size(1),
                             dtype=end_frame.dtype, device=end_frame.device
                         ).unsqueeze_(0)         # 1 x L
                         mask = length <= end_frame.unsqueeze(1)     # N x L
@@ -290,7 +316,7 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
 
                         score_r = disc(r, seq_end_frame, normalize=False)
                         score_f = disc(f, seq_end_frame, normalize=False)
-                    
+
                         loss_r = torch.nn.functional.relu(1-score_r).mean()
                         loss_f = torch.nn.functional.relu(1+score_f).mean()
 
@@ -314,16 +340,10 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
                         real_loss.append(score_r.mean().item())
                         fake_loss.append(score_f.mean().item())
 
-
             model.eval()
             with torch.no_grad():
                 terminate = torch.cat(buffer["terminate"])
-                if multi_critics:
-                    # reward_weights = torch.cat(buffer["reward_weights"])
-                    # rewards = torch.empty_like(reward_weights)
-                    pass
-                else:
-                    # reward_weights = None
+                if not multi_critics:
                     rewards = None
                 for name, disc, _, ob, seq_end_frame in disc_data:
                     r = (disc(ob, seq_end_frame, normalize=False).clamp_(-1, 1)
@@ -343,81 +363,44 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
                 rewards[terminate] = training_params.terminate_reward
                 rewards_ = rewards.view(HORIZON, -1, rewards.size(-1))
                 not_done = buffer["not_done"]
-
-                values1 = torch.cat(buffer["v1"])
-                values1_ = torch.cat(buffer["v1_"])
-                if model1.value_normalizer is not None:
-                    values1 = model1.value_normalizer(values1, unnorm=True)
-                    values1_ = model1.value_normalizer(values1_, unnorm=True)
-                values1_[terminate] = 0
-                values1 = values1.view(HORIZON, -1, values1.size(-1))
-                values1_ = values1_.view(HORIZON, -1, values1_.size(-1))
-
-                advantages1 = (rewards_[...,[0,1,4]] - values1).add_(values1_, alpha=GAMMA)
-                for t in reversed(range(HORIZON-1)):
-                    # advantages1[t].addcmul_(advantages1[t+1], not_done[t], value=GAMMA_LAMBDA)
-                    advantages1[t].add_(advantages1[t+1]*not_done[t], alpha=GAMMA_LAMBDA)
-                advantages1 = advantages1.view(-1, advantages1.size(-1))
-                returns1 = advantages1 + values1.view(-1, advantages1.size(-1))
-                sigma, mu = torch.std_mean(advantages1, dim=0, unbiased=True)
-                advantages1 = (advantages1 - mu) / (sigma + 1e-8) # (HORIZON x N_ENVS) x N_DISC
-                log_probs1 = torch.cat(buffer["lp1"])
-                actions1 = torch.cat(buffer["a1"])
-
-                if TWO_HANDS:
-                    values2 = torch.cat(buffer["v2"])
-                    values2_ = torch.cat(buffer["v2_"])
-                    if model2.value_normalizer is not None:
-                        values2 = model2.value_normalizer(values2, unnorm=True)
-                        values2_ = model2.value_normalizer(values2_, unnorm=True)
-                    values2_[terminate] = 0
-                    values2 = values2.view(HORIZON, -1, values2.size(-1))
-                    values2_ = values2_.view(HORIZON, -1, values2_.size(-1))
-
-                    advantages2 = (rewards_[...,[2,3,5]] - values2).add_(values2_, alpha=GAMMA)
-                    for t in reversed(range(HORIZON-1)):
-                        # advantages2[t].addcmul_(advantages2[t+1], not_done[t], value=GAMMA_LAMBDA)
-                        advantages2[t].add_(advantages2[t+1]*not_done[t], alpha=GAMMA_LAMBDA)
-                    advantages2 = advantages2.view(-1, advantages2.size(-1))
-                    returns2 = advantages2 + values2.view(-1, advantages2.size(-1))
-                    sigma, mu = torch.std_mean(advantages2, dim=0, unbiased=True)
-                    advantages2 = (advantages2 - mu) / (sigma + 1e-8) # (HORIZON x N_ENVS) x N_DISC
-                    log_probs2 = torch.cat(buffer["lp2"])
-                    actions2 = torch.cat(buffer["a2"])
-
                 states = torch.cat(buffer["s"])
-                if model1.use_rnn:
-                    states_raw = model1.observe(states, norm=False)[0]
-                    if OB_HORIZON > 1:
-                        length = torch.arange(env.ob_horizon, 
-                            dtype=ob_seq_lens.dtype, device=ob_seq_lens.device)
-                        mask = length.unsqueeze_(0) < ob_seq_lens.unsqueeze(1)
-                        states_raw = states_raw[mask]
-                    model1.ob_normalizer.update(states_raw, count_scale=N_ENVS) # use count_scale to prevent normalizer converge too fast when env is large
-                else:
-                    model1.ob_normalizer.update(states, count_scale=N_ENVS)
-                if model1.value_normalizer is not None:
-                    model1.value_normalizer.update(returns1)
-                    returns1 = model1.value_normalizer(returns1)
-                if multi_critics:
-                    advantages1 = advantages1.mul_(reward_weights1)
-                if TWO_HANDS:
-                    if model2.use_rnn:
-                        if not model1.use_rnn:
-                            states_raw = model2.observe(states, norm=False)[0]
-                            if OB_HORIZON > 1:
-                                length = torch.arange(env.ob_horizon, 
-                                    dtype=ob_seq_lens.dtype, device=ob_seq_lens.device)
-                                mask = length.unsqueeze_(0) < ob_seq_lens.unsqueeze(1)
-                                states_raw = states_raw[mask]
-                        model2.ob_normalizer.update(states_raw, count_scale=N_ENVS) # use count_scale to prevent normalizer converge too fast when env is large
+
+                batches = []
+                for i, m in enumerate(models):
+                    r_ = rewards_ if cols[i] is None else rewards_[..., cols[i]]
+                    values = torch.cat(buffer["v"][i])
+                    values_ = torch.cat(buffer["v_"][i])
+                    if m.value_normalizer is not None:
+                        values = m.value_normalizer(values, unnorm=True)
+                        values_ = m.value_normalizer(values_, unnorm=True)
+                    values_[terminate] = 0
+                    values = values.view(HORIZON, -1, values.size(-1))
+                    values_ = values_.view(HORIZON, -1, values_.size(-1))
+
+                    advantages = (r_ - values).add_(values_, alpha=GAMMA)
+                    for t in reversed(range(HORIZON-1)):
+                        advantages[t].add_(advantages[t+1]*not_done[t], alpha=GAMMA_LAMBDA)
+                    advantages = advantages.view(-1, advantages.size(-1))
+                    returns = advantages + values.view(-1, advantages.size(-1))
+                    sigma, mu = torch.std_mean(advantages, dim=0, unbiased=True)
+                    advantages = (advantages - mu) / (sigma + 1e-8)
+
+                    if m.use_rnn:
+                        states_raw = m.observe(states, norm=False)[0]
+                        if OB_HORIZON > 1:
+                            length = torch.arange(env.ob_horizon,
+                                dtype=ob_seq_lens.dtype, device=ob_seq_lens.device)
+                            mask = length.unsqueeze_(0) < ob_seq_lens.unsqueeze(1)
+                            states_raw = states_raw[mask]
+                        m.ob_normalizer.update(states_raw, count_scale=N_ENVS) # count_scale keeps the normalizer from converging too fast with many envs
                     else:
-                        model2.ob_normalizer.update(states, count_scale=N_ENVS)
-                    if model2.value_normalizer is not None:
-                        model2.value_normalizer.update(returns2)
-                        returns2 = model2.value_normalizer(returns2)
+                        m.ob_normalizer.update(states, count_scale=N_ENVS)
+                    if m.value_normalizer is not None:
+                        m.value_normalizer.update(returns)
+                        returns = m.value_normalizer(returns)
                     if multi_critics:
-                        advantages2 = advantages2.mul_(reward_weights2)
+                        advantages = advantages.mul_(reward_weights if cols[i] is None else reward_weights[cols[i]])
+                    batches.append((torch.cat(buffer["a"][i]), torch.cat(buffer["lp"][i]), advantages, returns))
 
             n_samples = states.size(0)
             policy_loss, value_loss = [], []
@@ -427,39 +410,39 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
                 for batch in range(n_samples // BATCH_SIZE):
                     sample = idx[BATCH_SIZE * batch: BATCH_SIZE *(batch+1)]
                     s = states[sample]
-                    a1 = actions1[sample]
-                    lp1 = log_probs1[sample]
-                    adv1 = advantages1[sample]
-                    v_t1 = returns1[sample]
                     end_frame = ob_seq_end_frames[sample]
 
-                    pi1_, v1_ = model1(s, end_frame)
-                    lp1_ = pi1_.log_prob(a1)
-                    lp1_ = lp1_.sum(-1, keepdim=True)
-                    ratio = torch.exp(lp1_ - lp1)
-                    clipped_ratio = torch.clamp(ratio, 1.0-0.2, 1.0+0.2)
-                    pg_loss = -torch.min(adv1*ratio, adv1*clipped_ratio).sum(-1).mean()
-                    vf_loss = (v1_ - v_t1).square().mean()
+                    pg_loss, vf_loss = 0, 0
+                    for m, (actions_, log_probs_, advantages_, returns_) in zip(models, batches):
+                        a = actions_[sample]
+                        lp = log_probs_[sample]
+                        adv = advantages_[sample]
+                        v_t = returns_[sample]
 
-                    if TWO_HANDS:
-                        a2 = actions2[sample]
-                        lp2 = log_probs2[sample]
-                        adv2 = advantages2[sample]
-                        v_t2 = returns2[sample]
-                        pi2_, v2_ = model2(s, end_frame)
-                        lp2_ = pi2_.log_prob(a2)
-                        lp2_ = lp2_.sum(-1, keepdim=True)
-                        ratio = torch.exp(lp2_ - lp2)
+                        pi_, v_ = m(s, end_frame)
+                        use_reg = REG and m.actor.max_log_sigma is not None
+                        if use_reg:
+                            lp_ = pi_.log_prob(a)
+                            mask = m.actor.logit < m.actor.max_log_sigma
+                            lp_ = torch.where(mask, lp_, lp_.detach())
+                        else:
+                            lp_ = pi_.log_prob(a)
+                        lp_ = lp_.sum(-1, keepdim=True)
+                        ratio = torch.exp(lp_ - lp)
                         clipped_ratio = torch.clamp(ratio, 1.0-0.2, 1.0+0.2)
-                        pg_loss2 = -torch.min(adv2*ratio, adv2*clipped_ratio).sum(-1).mean()
-                        vf_loss2 = (v2_ - v_t2).square().mean()
-                        pg_loss = pg_loss + pg_loss2
-                        vf_loss = vf_loss + vf_loss2
+                        pg_loss = pg_loss - torch.min(adv*ratio, adv*clipped_ratio).sum(-1).mean()
+                        vf_loss = vf_loss + (v_ - v_t).square().mean()
+                        
+                        if use_reg:
+                            mask = torch.logical_not(mask)
+                            reg = (mask*pi_.scale).norm(2, dim=1).mean()
+                            pg_loss = pg_loss + REG*reg
 
                     loss = pg_loss + 0.5*vf_loss
+                    
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(ac1_parameters, 1.0)
-                    torch.nn.utils.clip_grad_norm_(ac2_parameters, 1.0)
+                    for params in ac_parameters:
+                        torch.nn.utils.clip_grad_norm_(params, 1.0)
 
                     optimizer.step()
                     optimizer.zero_grad()
@@ -468,7 +451,10 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
                     value_loss.append(vf_loss.item())
             model.eval()
             epoch += 1
-            for v in buffer.values(): v.clear()
+            buffer["s"].clear(); buffer["not_done"].clear(); buffer["terminate"].clear(); buffer["ob_seq_len"].clear()
+            if has_goal_reward: buffer["r"].clear()
+            for k in ("a", "v", "lp", "v_"):
+                for v in buffer[k]: v.clear()
             for buf in buffer_disc.values():
                 for v in buf.values(): v.clear()
 
@@ -495,17 +481,17 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
                         rewards_task = rewards_task.mean(0).cpu().tolist()
                         for i in range(len(rewards_task)):
                             logger.add_scalar("train/task_reward_{}".format(i), rewards_task[i], epoch)
-                    
+
                     for k, v in performance.items():
                         if v: logger.add_scalar("perform/{}".format(k), np.nanmean(v), epoch)
-            
+
             for v in performance.values(): v.clear()
             for v in real_losses.values(): v.clear()
             for v in fake_losses.values(): v.clear()
-            
+
             if SAVE_CKPT:
                 state = None
-                if epoch % 100 == 0:
+                if epoch % 100 == 0 or epoch % training_params.save_interval == 0:
                     state = dict(
                         model=model.state_dict(),
                         optimizer=optimizer.state_dict(),
@@ -513,29 +499,12 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
                         rng_state=get_rng_state(device),
                         epoch=epoch
                     )
-                    if hasattr(env, "average_reward"):
-                        state["average_reward"] = env.average_reward
-                    if hasattr(env, "tracking_motion_samples"):
-                        state["tracking_motion_samples"] = env.tracking_motion_samples
-                    if hasattr(env, "track_note_samples"):
-                        state["track_note_samples"] = env.track_note_samples
-
+                    for k in ("average_reward", "tracking_motion_samples", "track_note_samples"):
+                        if hasattr(env, k):
+                            state[k] = getattr(env, k)
+                if epoch % 100 == 0:
                     torch.save(state, os.path.join(ckpt_dir, "ckpt"))
                 if epoch % training_params.save_interval == 0:
-                    if state is None:
-                        state = dict(
-                            model=model.state_dict(),
-                            optimizer=optimizer.state_dict(),
-                            disc_optimizer={n: disc_opt.state_dict() for n, disc_opt in disc_optimizer.items()},
-                            rng_state=get_rng_state(device),
-                            epoch=epoch
-                        )
-                        if hasattr(env, "average_reward"):
-                            state["average_reward"] = env.average_reward
-                        if hasattr(env, "tracking_motion_samples"):
-                            state["tracking_motion_samples"] = env.tracking_motion_samples
-                        if hasattr(env, "track_note_samples"):
-                            state["track_note_samples"] = env.track_note_samples
                     torch.save(state, os.path.join(ckpt_dir, "ckpt-{}".format(epoch)))
             if epoch > training_params.max_epochs: exit()
             tic = time.time()
@@ -546,6 +515,17 @@ if __name__ == "__main__":
     spec.loader.exec_module(config)
     if settings.note is not None:
         config.env_params["note_file"] = settings.note
+    if settings.character is not None:
+        # nargs="+" yields a list. Single path -> string, multiple -> list
+        # (Env._resolve_character_model handles both forms).
+        cm = settings.character
+        config.env_params["character_model"] = cm[0] if len(cm) == 1 else cm
+    if settings.motion is not None:
+        config.env_params["motion_file"] = settings.motion
+    if settings.backend is not None:
+        config.env_params["backend"] = settings.backend
+    if settings.normalize_value:
+        config.model_params = dict(getattr(config, "model_params", {}), normalize_value=True)
 
     if settings.device.lower() == "cpu":
         settings.device = "cpu"
@@ -573,6 +553,10 @@ if __name__ == "__main__":
             import shutil, inspect
             os.makedirs(settings.ckpt, exist_ok=True)
             shutil.copy(settings.config, settings.ckpt)
+            if settings.normalize_value:
+                # record the command-line override in the copied config
+                with open(os.path.join(settings.ckpt, os.path.basename(settings.config)), "a") as f:
+                    f.write("\n# set by main.py --normalize-value\nmodel_params[\"normalize_value\"] = True\n")
             shutil.copy(__file__, settings.ckpt)
             shutil.copy(env.__file__, settings.ckpt)
             shutil.copy("utils.py", settings.ckpt)
@@ -589,7 +573,7 @@ if __name__ == "__main__":
 
     env = env_cls(num_envs,
         discriminators=discriminators,
-        compute_device=settings.device, 
+        compute_device=settings.device,
         **config.env_params
     )
     if settings.test:
@@ -598,8 +582,8 @@ if __name__ == "__main__":
     use_rnn = env.ob_horizon > 1
     value_dim = len(env.discriminators)+env.rew_dim
     state_dim, goal_dim = env.state_dim, env.goal_dim
-    
-    if hasattr(env, "two_hands") and env.two_hands:
+
+    if getattr(env, "two_hands", False):
         model1 = ACModel(use_rnn, state_dim, env.act_dim//2, goal_dim, value_dim//2, **config.model_params)
         model2 = ACModel(use_rnn, state_dim, env.act_dim//2, goal_dim, value_dim//2, **config.model_params)
         model = torch.nn.ModuleList([model1, model2])
@@ -609,7 +593,7 @@ if __name__ == "__main__":
     discriminators = torch.nn.ModuleDict({
         name: Discriminator(dim) for name, dim in env.disc_dim.items()
     })
-    device = torch.device(settings.device)
+    device = env.device  # the native MuJoCo backend runs on the CPU
     model.to(device)
     discriminators.to(device)
     model.discriminators = discriminators
@@ -625,7 +609,15 @@ if __name__ == "__main__":
                 print("Load model from {}".format(ckpt))
                 print(model)
                 state_dict = torch.load(ckpt, map_location=device, weights_only=False)
-                model.load_state_dict(state_dict["model"])
+                # A pretrained checkpoint keeps only the actor and the observation
+                # normalizer mean/var (see runs/PRETRAINED.md). Running the policy
+                # needs nothing else, so allow the other entries to be missing.
+                res = model.load_state_dict(state_dict["model"], strict=False)
+                needed = [k for k in res.missing_keys
+                    if not k.startswith("discriminators.") and (".actor." in "." + k or k.split(".")[-2:] in (["ob_normalizer", "mean"], ["ob_normalizer", "var"]))]
+                if needed or res.unexpected_keys:
+                    raise RuntimeError("Checkpoint {} does not match the policy. Missing: {} Unexpected: {}".format(
+                        ckpt, needed[:5], res.unexpected_keys[:5]))
         env.render()
         test(env, model)
     else:

@@ -1,6 +1,17 @@
 from typing import Tuple
 import torch
 
+def xquat_to_xyzw(xquat: torch.Tensor) -> torch.Tensor:
+    """(w, x, y, z), as MuJoCo and mujoco_warp store quaternions, to (x, y, z, w), as this code uses."""
+    # torch.roll instead of a Python-list index, which is copied to the GPU (a host sync) on every call.
+    return torch.roll(xquat, -1, dims=-1)
+
+
+def xyzw_to_wxyz(xyzw: torch.Tensor) -> torch.Tensor:
+    """(x, y, z, w) to (w, x, y, z), the inverse of xquat_to_xyzw."""
+    return torch.roll(xyzw, 1, dims=-1)
+
+
 @torch.jit.script
 def euler_xyz(q: torch.Tensor, epsilon: float=0):
     q1, q2, q3, q0 = torch.unbind(q, -1)

@@ -1,0 +1,13 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.venv/
+uv.lock
+MUJOCO_LOG.TXT
+
+# reference motion dataset (scripts/download_motions.sh) and training outputs
+/motions
+/runs
+
+# pretrained checkpoints are hosted on Hugging Face (xupei0610/MUSIC)
+/pretrained/**/*.ckpt

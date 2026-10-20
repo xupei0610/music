@@ -12,9 +12,9 @@
     <include file="right_assets/right_hand_actuators_muscle.xml" />
     
     <asset>
-        <!-- <texture name="grid" type="2d" builtin="checker" rgb1="0.10000000000000001 0.10000000000000001 0.10000000000000001" rgb2="0.20000000000000001 0.20000000000000001 0.20000000000000001" width="512" height="512"/> -->
-        <!-- <material name="grid" texture="grid" texrepeat="1 1" texuniform="true" reflectance="0.20000000000000001"/> -->
-        <!-- <texture name="skybox" type="skybox" builtin="gradient" rgb1="0.20000000000000001 0.20000000000000001 0.20000000000000001" rgb2="0 0 0" mark="random" markrgb="1 1 1" width="800" height="800"/> -->
+        <texture name="grid" type="2d" builtin="checker" rgb1="0.10000000000000001 0.10000000000000001 0.10000000000000001" rgb2="0.20000000000000001 0.20000000000000001 0.20000000000000001" width="512" height="512"/>
+        <material name="grid" texture="grid" texrepeat="1 1" texuniform="true" reflectance="0.20000000000000001"/>
+        <texture name="skybox" type="skybox" builtin="gradient" rgb1="0.20000000000000001 0.20000000000000001 0.20000000000000001" rgb2="0 0 0" mark="random" markrgb="1 1 1" width="800" height="800"/>
     </asset>
 
     <visual>
@@ -24,8 +24,8 @@
     </visual>
 
     <worldbody>
-        <!-- <light name="//unnamed_light_1" directional="false" pos="0.29999999999999999 0 1" dir="0 0 -1"/> -->
-        <!-- <geom name="//unnamed_geom_0" pos="0 0 -0.2" type="plane" contype="0" conaffinity="0" size="1 1 0.050000000000000003" material="grid"/> -->
+        <light name="//unnamed_light_1" directional="false" pos="0.29999999999999999 0 1" dir="0 0 -1"/>
+        <geom name="//unnamed_geom_0" pos="0 0 -0.2" type="plane" contype="0" conaffinity="0" size="1 1 0.050000000000000003" material="grid"/>
 
         <include file="left_assets/left_hand_freeroot.xml"/>
         <include file="right_assets/right_hand_freeroot.xml"/>

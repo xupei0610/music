@@ -5,7 +5,11 @@ os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = ".2"
 # use `ulimit -n 4096` beforehand to increase the number of files that can be opened by one process
 
 import resource
-resource.setrlimit(resource.RLIMIT_CORE, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
+# Enable core dumps up to what the system allows. An unprivileged process may
+# raise its soft limit only up to the hard limit, so (INF, INF) fails with
+# "not allowed to raise maximum limit" wherever the hard core limit is finite.
+_, _core_hard = resource.getrlimit(resource.RLIMIT_CORE)
+resource.setrlimit(resource.RLIMIT_CORE, (_core_hard, _core_hard))
 
 env_cls = "PianoJointPD"
 env_params = dict(
@@ -14,6 +18,11 @@ env_params = dict(
     control_freq=1,
     episode_length = 30*5,
     contactable_links = None,
+
+    # mujoco_warp buffers per world. Measured with 2048-4096 envs: ~6 contacts and
+    # at most ~280 constraints per world (38 contacts in the initial pose).
+    nconmax = 64,
+    njmax = 512,
 
     goal_reward_weight = [0.4, 0.4],
 
@@ -58,7 +67,7 @@ env_params = dict(
         "L:proxph5",
         "L:midph5",
         "L:distph5",
-        "L:LFtip"
+        "L:LFtip",
 
         "R:ulna",
         "R:radius",
@@ -100,11 +109,12 @@ env_params = dict(
 )
 
 training_params = dict(
-    max_epochs =    200000,
-    save_interval =  20000,
+    max_epochs =     25000,
+    save_interval =   5000,
     horizon = 8,
     num_envs = 2048,
-    terminate_reward = -25
+    terminate_reward = -25,
+    reg = 10,   # penalty on action stds at the max_sigma cap (see main.py)
 )
 
 model_params = dict(

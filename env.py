@@ -1,34 +1,43 @@
 from typing import Callable, Optional, Union, List, Dict, Any, Sequence
-import os, pickle
-os.environ['XLA_FLAGS'] = (
-    '--xla_gpu_triton_gemm_any=True '
-)
+import math
+import os, pickle, sys, tempfile, time
+import resource
 
-import jax
-jax.config.update('jax_default_matmul_precision', 'highest')
+# The discriminator sample workers send their batches as shared-memory torch
+# tensors, one file descriptor per tensor (128 per batch and discriminator).
+# The common default soft limit of 1024 open files is too low ("received 0
+# items of ancdata"), so raise it to the hard limit, as `ulimit -n` would.
+# Child processes inherit it.
+_nofile_soft, _nofile_hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+_nofile_want = 65536 if _nofile_hard == resource.RLIM_INFINITY else min(_nofile_hard, 65536)
+if _nofile_soft != resource.RLIM_INFINITY and _nofile_soft < _nofile_want:
+    resource.setrlimit(resource.RLIMIT_NOFILE, (_nofile_want, _nofile_hard))
 
-import jax.numpy as jnp
 import mujoco
-from mujoco import mjx
 import mujoco.viewer
 
 import numpy as np
 import torch
-from torch.utils.dlpack import from_dlpack as dlpack2pytorch
-from jax.dlpack import from_dlpack as dlpack2jax
 
-from utils import heading_zup, axang2quat, rotatepoint, quatconj, quatmultiply, quat2expmap, quat2expmap2
+from utils import heading_zup, axang2quat, rotatepoint, quatconj, quatmultiply, quat2expmap, quat2expmap2, xquat_to_xyzw
+from sim import make_simulator, backend_device
 
-def torch2jax(tensor: torch.Tensor, device=None):
-    return dlpack2jax(tensor.flatten(), device=device).reshape(tensor.shape)
 
-def jax2torch(array: jax.Array, device=None):
-    return dlpack2pytorch(array.__dlpack__()).to(device=device)
+def warp2torch(arr) -> torch.Tensor:
+    """Zero-copy torch view of a warp array (for scripts that use env.mjx_data)."""
+    import warp as wp
+    return wp.to_torch(arr)
+
+
+def _masked_mean(x: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+    """x[m].float().mean() without the host sync of boolean indexing; NaN if m is empty."""
+    return torch.where(m, x, 0).float().sum() / m.sum()
+
 
 class DiscriminatorConfig(object):
     def __init__(self,
         key_links: Optional[List[str]]=None, key_link_index_offset: Optional[int]=None,
-        ob_horizon: Optional[int]=None, 
+        ob_horizon: Optional[int]=None,
         parent_link: Optional[str]=None,
         local_pos: Optional[bool]=None, global_pos: bool=False,
         replay_speed: Optional[str]=None, motion_file: Optional[str]=None,
@@ -44,6 +53,7 @@ class DiscriminatorConfig(object):
         self.ob_horizon = ob_horizon
         self.weight = weight
 
+
 class Env(object):
     UP_AXIS = 2
     CHARACTER_MODEL = None
@@ -55,7 +65,7 @@ class Env(object):
         episode_length: Optional[Union[Callable, int]] = 300,
         control_mode: str = "none",
         compute_device: int = 0,
-        character_model: Optional[str] = None,
+        character_model: Optional[Union[str, Sequence[str]]] = None,
         **kwargs
     ):
         self.viewer = None
@@ -65,18 +75,21 @@ class Env(object):
         assert control_mode in ["direct", "position", "muscle", "none"]
         self.control_mode = control_mode
         self.episode_length = episode_length
-        self.device = torch.device(compute_device)
-        if compute_device == "cpu":
-            self.jax_device = jax.devices("cpu")[0]
-        else:
-            self.jax_device = jax.devices("gpu")[compute_device]
-        jax.config.update("jax_default_device", self.jax_device)
+        # simulator behind the task: "warp" (mujoco_warp, batched, GPU) or "mujoco" (native, CPU)
+        self.backend = kwargs.get("backend", "warp")
+        self.compute_device = compute_device
+        self.device = backend_device(self.backend, compute_device)
 
         self.camera_pos = self.CAMERA_POS
         self.camera_following = self.CAMERA_FOLLOWING
         self.character_model = self.CHARACTER_MODEL if character_model is None else character_model
 
         self.n_envs = n_envs
+        # warp only: per-world contact / constraint buffer sizes (None: derived
+        # from the MJCF) and CUDA graphs for the physics and kinematics
+        self.nconmax = kwargs.get("nconmax")
+        self.njmax = kwargs.get("njmax")
+        self.cuda_graph = kwargs.get("cuda_graph", True)
         self.prepare_sim()
         self.setup_action_normalizer()
 
@@ -113,26 +126,82 @@ class Env(object):
 
 
     def update_viewer(self):
-        if self.n_envs == 1:
-            mjx.get_data_into([self.mj_data], self.mj_model, self.mjx_data)
-        else:
-            d_i = jax.tree_util.tree_map(lambda x: x[-1], self.mjx_data)
-            self.mj_data.qpos[:] = d_i.qpos
-            mujoco.mj_forward(self.mj_model, self.mj_data)
+        self.sim.copy_to_mjdata(self.mj_data, 0)
+
+    @property
+    def mjx_model(self):
+        """The mujoco_warp model (warp backend only)."""
+        return self.sim.model
+
+    @property
+    def mjx_data(self):
+        """The mujoco_warp data (warp backend only)."""
+        return self.sim.data
 
     def refresh_tensors(self):
-        self.mjx_data = self.mjx_kinematics(self.mjx_model, self.mjx_data)
-        # for root body
-        # angular vel, qvel[:, 3:] = self.mjx_data.xmat[0, 1].T @ self.mjx_data.cvel[..., :3] # local frame
-        # linear vel, qvel[:, :3] == self.mjx_data.cvel[:,1, 3:6] - jnp.cross(self.mjx_data.xpos[:,1]-self.mjx_data.subtree_com[:, self.mj_model.body_rootid[1]], self.mjx_data.cvel[:,1, :3]) # global frame
-        link_xpos = self.mjx_data.xpos
-        link_xquat = self.mjx_data.xquat[..., [1, 2, 3, 0]]
-        link_cvel = self.mjx_data.cvel
-        link_state = jnp.concatenate([link_xpos, link_xquat, link_cvel], axis=-1)[:, 1:] # link 0 is the world body
-        self.link_tensor = jax2torch(link_state, device=self.device)
+        self.sim.refresh_kinematics()
+        # build a (n_envs, n_links, 13) link_tensor in xyzw quat order, excluding world body
+        link_xpos = self.sim.state("xpos")
+        link_xquat = xquat_to_xyzw(self.sim.state("xquat"))
+        link_cvel = self.sim.state("cvel")  # spatial vector (rot:lin) shape (n_envs, n_body, 6)
+        link_state = torch.cat([link_xpos, link_xquat, link_cvel], dim=-1)[:, 1:]
+        self.link_tensor = link_state.contiguous()
+
+    def _resolve_character_model(self):
+        """Return a path to a single MJCF that mj_model.from_xml_path can
+        load. If character_model is a string, return it as-is. If it's a
+        list/tuple of paths, build a transient wrapper MJCF that
+        <include>s each one in order, with paths made relative to the
+        wrapper's directory so MuJoCo can resolve them. The wrapper is
+        written next to the first (arm) MJCF and removed after load by
+        prepare_sim. Use case: combine a character model with one or more
+        include-files (for example, scene objects) without editing the
+        character XML."""
+        cm = self.character_model
+        if isinstance(cm, (str, os.PathLike)):
+            return str(cm), None
+        parts = list(cm)
+        if not parts:
+            raise ValueError("character_model is an empty list")
+        if len(parts) == 1:
+            return str(parts[0]), None
+
+        primary = os.path.abspath(str(parts[0]))
+        primary_dir = os.path.dirname(primary)
+
+        rel_paths = []
+        for p in parts:
+            ap = os.path.abspath(str(p))
+            try:
+                rel = os.path.relpath(ap, primary_dir)
+            except ValueError:
+                # Different drives on Windows -- fall back to absolute.
+                rel = ap
+            rel_paths.append(rel)
+
+        body = "\n".join(f'  <include file="{r}"/>' for r in rel_paths)
+        text = f'<mujoco model="merged_character_model">\n{body}\n</mujoco>\n'
+
+        fd, tmp_path = tempfile.mkstemp(
+            suffix=".xml",
+            prefix="merged_",
+            dir=primary_dir,
+        )
+        os.close(fd)
+        with open(tmp_path, "w") as f:
+            f.write(text)
+        return tmp_path, tmp_path  # second value: the temp file to remove later
 
     def prepare_sim(self, opt={}):
-        self.mj_model = mujoco.MjModel.from_xml_path(self.character_model)
+        xml_path, tmp_to_remove = self._resolve_character_model()
+        try:
+            self.mj_model = mujoco.MjModel.from_xml_path(xml_path)
+        finally:
+            if tmp_to_remove is not None:
+                try:
+                    os.unlink(tmp_to_remove)
+                except FileNotFoundError:
+                    pass
 
         self.mj_model.opt.solver = mujoco.mjtSolver.mjSOL_NEWTON
         self.mj_model.opt.iterations = 30
@@ -143,6 +212,7 @@ class Env(object):
             setattr(self.mj_model.opt, k, v)
         print(self.mj_model.opt)
         self.mj_data = mujoco.MjData(self.mj_model)
+        mujoco.mj_forward(self.mj_model, self.mj_data)
 
         bodies = []
         for i in range(self.mj_model.nbody):
@@ -154,8 +224,8 @@ class Env(object):
             a = self.mj_model.actuator(i)
             actuators.append((a.name, a.id))
         print(actuators, len(self.mj_data.ctrl))
-        
-        self._put_to_mjx()
+
+        self._make_simulator()
 
         self.root_links = []
         root_link_qidx = []
@@ -163,7 +233,7 @@ class Env(object):
         for jnt in range(self.mj_model.njnt):
             jnt = self.mj_model.jnt(jnt)
             if jnt.type == mujoco.mjtJoint.mjJNT_FREE:
-                self.root_links.append(int(jnt.bodyid[0]-1)) # exclue the world body
+                self.root_links.append(int(jnt.bodyid[0]-1))
                 root_link_qidx.append(int(jnt.qposadr[0]))
 
                 qpos_range[0].extend([-np.inf]*7)
@@ -174,103 +244,60 @@ class Env(object):
         if self.root_links:
             character_qidx = []
             if root_link_qidx[0] > 0:
-                character_qidx.append((-1, root_link_qidx[0])) 
+                character_qidx.append((-1, root_link_qidx[0]))
             for i in range(len(root_link_qidx)-1):
                 character_qidx.append((root_link_qidx[i], root_link_qidx[i+1]-root_link_qidx[i]-7))
             character_qidx.append((root_link_qidx[-1], len(self.mj_data.qpos)-root_link_qidx[-1]))
         else:
             character_qidx = [(-1, self.mj_model.nv)]
-        
+
         # prevent extreme pose outside the control of muscles
         qpos_range0 = np.add(qpos_range[0], np.subtract(qpos_range[1],qpos_range[0])*0.1)
         qpos_range1 = np.subtract(qpos_range[1], np.subtract(qpos_range[1],qpos_range[0])*0.1)
-        qpos_range0 = jnp.array(np.nan_to_num(qpos_range0, nan=-np.inf), device=self.jax_device)
-        qpos_range1 = jnp.array(np.nan_to_num(qpos_range1, nan=np.inf), device=self.jax_device)
+        qpos_range0 = torch.tensor(np.nan_to_num(qpos_range0, nan=-np.inf), dtype=torch.float, device=self.device)
+        qpos_range1 = torch.tensor(np.nan_to_num(qpos_range1, nan=np.inf), dtype=torch.float, device=self.device)
+        self._qpos_range0 = qpos_range0
+        self._qpos_range1 = qpos_range1
+        self._character_qidx = character_qidx
 
-        def reset_(env_ids, qpos, qvel, ref_root, ref_root_ang_vel, ref_joint_pos, ref_joint_vel):
-            jidx, ridx = 0, 0
-            q, v = [], []
-            for qidx0, ndofs in character_qidx:
-                jidx_ = jidx+ndofs
-                if qidx0 >= 0:
-                    q.append(ref_root[:, ridx, [0,1,2,6,3,4,5]])
-                    v.append(ref_root[:, ridx, 7:10])
-                    v.append(ref_root_ang_vel[:, ridx])
-                    ridx += 1
-                if jidx < ref_joint_pos.shape[1]:
-                    if jidx_ <= ref_joint_pos.shape[1]:
-                        q.append(ref_joint_pos[:, jidx:jidx_])
-                        v.append(ref_joint_vel[:, jidx:jidx_])
-                    else:
-                        q.append(ref_joint_pos[:, jidx:])
-                        v.append(ref_joint_vel[:, jidx:])
-                jidx = jidx_
-            
-            v = jnp.concatenate(v, -1)
-            qdim = v.shape[1]+ridx
-            if qpos.shape[1] > qdim:
-                q.append(jnp.zeros_like(qpos[env_ids, qdim:]))
-                qvel = qvel.at[env_ids, :v.shape[1]].set(v)
-                qvel = qvel.at[env_ids, v.shape[1]:].set(0)
-            else:
-                qvel = qvel.at[env_ids].set(v)
-            q = jnp.concatenate(q, -1)
-            q = jnp.clip(q, min=qpos_range0, max=qpos_range1)
-            qpos = qpos.at[env_ids].set(q)
-            return qpos, qvel
-        self.reset_pose_ = jax.jit(reset_, device=self.jax_device)
-    
-    def _put_to_mjx(self):
-        mjx_data = mjx.put_data(self.mj_model, self.mj_data, device=self.jax_device)
-        mjx_model = mjx.put_model(self.mj_model, device=self.jax_device)
+    def _reset_pose(self, env_ids, ref_root, ref_root_ang_vel, ref_joint_pos, ref_joint_vel):
+        qpos = self.sim.state("qpos")
+        qvel = self.sim.state("qvel")
+        jidx, ridx = 0, 0
+        q, v = [], []
+        for qidx0, ndofs in self._character_qidx:
+            jidx_ = jidx+ndofs
+            if qidx0 >= 0:
+                # ref_root is (N, n_root, 13) in xyzw order; mujoco qpos free-joint expects (px,py,pz, qw,qx,qy,qz)
+                root = ref_root[:, ridx]
+                q.append(torch.cat([root[..., 0:3], root[..., [6]], root[..., 3:6]], -1))
+                v.append(root[..., 7:10])
+                v.append(ref_root_ang_vel[:, ridx])
+                ridx += 1
+            if jidx < ref_joint_pos.shape[1]:
+                if jidx_ <= ref_joint_pos.shape[1]:
+                    q.append(ref_joint_pos[:, jidx:jidx_])
+                    v.append(ref_joint_vel[:, jidx:jidx_])
+                else:
+                    q.append(ref_joint_pos[:, jidx:])
+                    v.append(ref_joint_vel[:, jidx:])
+            jidx = jidx_
 
-        mjx_data = jax.vmap(lambda _, x: x, in_axes=(0, None))(jnp.arange(self.n_envs, device=self.jax_device), mjx_data)
-        self.mjx_step1 = jax.jit(jax.vmap(mjx.step, in_axes=(None, 0)), device=self.jax_device)
-
-        if self.mj_model.ntendon > 0:
-            from mujoco.mjx._src import smooth
-
-            def _kinematics(m, d):
-                # d = fwd_position(m, d)
-                d = smooth.kinematics(m, d)
-                d = smooth.com_pos(m, d)
-                # d = smooth.camlight(m, d)
-                d = smooth.tendon(m, d)
-                # d = smooth.crb(m, d)
-                # d = smooth.tendon_armature(m, d)
-                # d = smooth.factor_m(m, d)
-                # d = collision_driver.collision(m, d)
-                # d = collision(m, d)
-                # d = constraint.make_constraint(m, d)
-                # d = smooth.transmission(m, d)
-
-                # d = sensor.sensor_pos(m, d)
-                
-                # d = fwd_velocity(m, d)
-                d = d.tree_replace({
-                    '_impl.actuator_velocity': d._impl.actuator_moment @ d.qvel,
-                    '_impl.ten_velocity': d._impl.ten_J @ d.qvel,
-                })
-                d = smooth.com_vel(m, d)
-                # d = passive.passive(m, d)
-                # d = smooth.rne(m, d)
-                d = smooth.tendon_bias(m, d)
-
-                # d = sensor.sensor_vel(m, d)
-                # d = fwd_actuation(m, d)
-                # d = fwd_acceleration(m, d)
-                # if d._impl.efc_J.size == 0:
-                #     d = d.replace(qacc=d.qacc_smooth)
-                #     return d
-                # d = solver.solve(m, d)
-                return d
-
-            self.mjx_kinematics = jax.jit(jax.vmap(_kinematics, in_axes=(None, 0)), device=self.jax_device)
+        v = torch.cat(v, -1)
+        qdim = v.shape[1] + ridx
+        if qpos.shape[1] > qdim:
+            q.append(torch.zeros_like(qpos[env_ids, qdim:]))
+            qvel[env_ids, :v.shape[1]] = v
+            qvel[env_ids, v.shape[1]:] = 0
         else:
-            self.mjx_kinematics = jax.jit(jax.vmap(lambda model, data: mjx.com_vel(model, mjx.com_pos(model, mjx.kinematics(model, data))), in_axes=(None, 0)), device=self.jax_device)
+            qvel[env_ids] = v
+        q = torch.cat(q, -1)
+        q = torch.clamp(q, min=self._qpos_range0, max=self._qpos_range1)
+        qpos[env_ids] = q
 
-        self.mjx_data = mjx_data
-        self.mjx_model = mjx_model
+    def _make_simulator(self):
+        self.sim = make_simulator(self.backend, self.mj_model, self.mj_data, self.n_envs, self.compute_device,
+                                  nconmax=self.nconmax, njmax=self.njmax, cuda_graph=self.cuda_graph)
 
     def setup_action_normalizer(self):
         action_upper = []
@@ -301,7 +328,6 @@ class Env(object):
                     raise ValueError("Unsupported actuator type {} for actuator {}.".format(actuator.trntype[0], actuator.name))
                 action_scale.append(2)
             elif self.control_mode == "muscle" or (self.control_mode == "none" and actuator.biastype[0] == 2):
-                # no action normalization for muscle control
                 lower_limit = -1
                 upper_limit = 1
                 self.muscle_control = True
@@ -315,9 +341,9 @@ class Env(object):
         action_lower = np.array(action_lower)
         self.action_offset = torch.tensor(0.5 * (action_upper + action_lower), dtype=torch.float, device=self.device)
         self.action_scale = torch.tensor(action_scale * (0.5 * (action_upper - action_lower)), dtype=torch.float, device=self.device)
-            
+
         if not self.muscle_control:
-            self.actuator_forcerange = jax2torch(self.mjx_model.actuator_forcerange[:-6,1], device=self.device)
+            self.actuator_forcerange = torch.tensor(self.mj_model.actuator_forcerange[:-6, 1], dtype=torch.float, device=self.device)
 
     def process_actions(self, actions: torch.Tensor) -> torch.Tensor:
         return actions*self.action_scale + self.action_offset
@@ -343,41 +369,38 @@ class Env(object):
     def reset_envs(self, env_ids0):
         ref_link_tensor, ref_joint_tensor = self.init_state(env_ids0)
 
-        self.lifetime[env_ids0] = 0
-        env_ids = torch2jax(env_ids0, device=self.jax_device)
+        self.lifetime.index_fill_(0, env_ids0, 0)
+        env_ids = env_ids0
 
         if self.root_links:
-            ref_root_tensor = ref_link_tensor[:,self.root_links]
-            # free joint's angular velocity in qvel is defined locally
-            # https://mujoco.readthedocs.io/en/stable/overview.html#floating-objects
-            ref_root_ang_vel_tensor = rotatepoint(quatconj(ref_root_tensor[...,3:7]), ref_root_tensor[...,10:13])
-            ref_root = torch2jax(ref_root_tensor, device=self.jax_device)
-            ref_root_ang_vel = torch2jax(ref_root_ang_vel_tensor, device=self.jax_device)
+            ref_root_tensor = ref_link_tensor[:, self.root_links]
+            ref_root_ang_vel_tensor = rotatepoint(quatconj(ref_root_tensor[..., 3:7]), ref_root_tensor[..., 10:13])
+            ref_root = ref_root_tensor
+            ref_root_ang_vel = ref_root_ang_vel_tensor
         else:
             ref_root, ref_root_ang_vel = None, None
-        ref_joint_pos = torch2jax(ref_joint_tensor[0], device=self.jax_device)
-        ref_joint_vel = torch2jax(ref_joint_tensor[1], device=self.jax_device)
+        ref_joint_pos = ref_joint_tensor[0]
+        ref_joint_vel = ref_joint_tensor[1]
 
-        qpos, qvel = self.reset_pose_(env_ids, self.mjx_data.qpos, self.mjx_data.qvel, ref_root, ref_root_ang_vel, ref_joint_pos, ref_joint_vel)
-        qacc_warmstart = self.mjx_data.qacc_warmstart.at[env_ids].set(0)
+        self._reset_pose(env_ids, ref_root, ref_root_ang_vel, ref_joint_pos, ref_joint_vel)
+
+        qacc_warmstart = self.sim.state("qacc_warmstart")
+        # index_fill_ takes the fill value as a scalar argument; `x[ids] = 0`
+        # copies a CPU tensor to the GPU, which waits for all queued GPU work.
+        qacc_warmstart.index_fill_(0, env_ids, 0)
         if self.muscle_control:
+            act = self.sim.state("act")
             if self.training and self.random_init:
-                idx = np.random.randint(0, self.n_envs, len(env_ids))
-                act = self.mjx_data.act.at[env_ids].set(self.mjx_data.act[idx])
+                idx = torch.from_numpy(np.random.randint(0, self.n_envs, len(env_ids))).to(self.device)
+                act[env_ids] = act[idx]
             else:
-                act = self.mjx_data.act.at[env_ids].set(0)
-            self.mjx_data = self.mjx_data.replace(qpos=qpos, qvel=qvel, act=act, qacc_warmstart=qacc_warmstart)
-        else:
-            self.mjx_data = self.mjx_data.replace(qpos=qpos, qvel=qvel, qacc_warmstart=qacc_warmstart)
+                act.index_fill_(0, env_ids, 0)
         self.refresh_tensors()
 
     def do_simulation(self, actions):
-        ctrl = torch2jax(actions, device=self.jax_device)
-        data = self.mjx_data.replace(ctrl=ctrl)
-        model = self.mjx_model
-        for _ in range(self.frameskip):
-            data = self.mjx_step1(model, data)
-        self.mjx_data = data
+        # actions is (n_envs, nu)
+        self.sim.state("ctrl").copy_(actions)
+        self.sim.step(self.frameskip)
         self.simulation_step += 1
 
     def step(self, actions):
@@ -387,7 +410,7 @@ class Env(object):
             self.refresh_tensors()
             self.lifetime += 1
         rewards = self.reward()
-        terminate = self.termination_check()                    # N
+        terminate = self.termination_check()
         self.info["terminate"] = terminate
         if self.viewer_pause:
             overtime = None
@@ -397,21 +420,28 @@ class Env(object):
             self.done = torch.logical_or(overtime, terminate)
         else:
             self.done = terminate
-        
+
         if self.viewer is not None:
             if not self.viewer.is_running(): exit()
             self.update_viewer()
             self.viewer.sync()
+            # Play in real time: one control step per step_time of wall time.
+            # A step that runs late does not shorten the next one.
+            now = time.perf_counter()
+            due = getattr(self, "_viewer_due", now)
+            if due > now:
+                time.sleep(due - now)
+            self._viewer_due = max(due, now) + self.step_time
 
         self.obs = self.observe()
         return self.obs, rewards, self.done, self.info
 
     def init_state(self, env_ids):
         raise NotImplementedError()
-    
+
     def observe(self, env_ids=None):
         raise NotImplementedError()
-    
+
     def overtime_check(self):
         if self.episode_length is None: return None
         if callable(self.episode_length):
@@ -426,7 +456,6 @@ class Env(object):
 
 
 from ref_motion import ReferenceMotion
-import numpy as np
 
 
 class ICCGANHumanoid(Env):
@@ -441,11 +470,11 @@ class ICCGANHumanoid(Env):
     GOAL_TENSOR_DIM = None
 
     OB_HORIZON = 4
-    KEY_LINKS = None    # all links
-    PARENT_LINK = None  # root link
-    LOCAL_POS = None    # local frame defined on the root position projected on the ground
-    GLOBAL_POS = False  # not use global tranformation, set it to true will replace the PARENT_LINK and LOCAL_POS settings
-    INCLUDE_VEL = True  # include velocity state in the observation
+    KEY_LINKS = None
+    PARENT_LINK = None
+    LOCAL_POS = None
+    GLOBAL_POS = False
+    INCLUDE_VEL = True
 
 
     def __init__(self, *args,
@@ -477,15 +506,10 @@ class ICCGANHumanoid(Env):
                 body_id = geom.bodyid[0]
                 if body_id in contactable_link_idx:
                     contactable_geoms.append(i)
-            contactable_geoms = jnp.array(contactable_geoms, device=self.jax_device)
-
-            def ground_contact_test_(data):
-                contact = data.contact
-                contact1 = jnp.logical_and(contact.geom1==0, jnp.all(contact.geom2[...,None] != contactable_geoms, -1))
-                contact2 = jnp.logical_and(contact.geom2==0, jnp.all(contact.geom1[...,None] != contactable_geoms, -1))
-                return jnp.any(jnp.logical_and(jnp.logical_or(contact1, contact2), contact.dist < 0.01), -1)
-            self._ground_contact_test = jax.jit(ground_contact_test_)
+            self._contactable_geoms = torch.tensor(contactable_geoms, dtype=torch.int32, device=self.device)
+            self._ground_contact_test = self._ground_contact_test_sim
         else:
+            self._contactable_geoms = None
             self._ground_contact_test = None
 
 
@@ -498,7 +522,7 @@ class ICCGANHumanoid(Env):
                 reward_weights[:, i] = w
         elif self.rew_dim:
             goal_reward_weight = []
-            assert self.rew_dim == len(goal_reward_weight), "{} vs {}".format(self.rew_dim, len(goal_reward_weight)) 
+            assert self.rew_dim == len(goal_reward_weight), "{} vs {}".format(self.rew_dim, len(goal_reward_weight))
 
         n_comp = len(discriminators) + self.rew_dim
         if n_comp > 1:
@@ -524,15 +548,15 @@ class ICCGANHumanoid(Env):
             else:
                 key_links = []
                 for link in config.key_links:
-                    lid = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, link) - 1 # exclude world body
-                    assert lid != -1, "Unrecognized key link {}".format(link)
+                    lid = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, link) - 1
+                    assert lid >= 0, "Unrecognized key link {}".format(link)
                     key_links.append(lid)
                 key_links = sorted(key_links)
             if config.parent_link is None:
                 parent_link = None
             else:
-                parent_link = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, config.parent_link) - 1 # exclude world body
-                assert parent_link != -1, "Unrecognized parent link {}".format(parent_link)
+                parent_link = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, config.parent_link) - 1
+                assert parent_link >= 0, "Unrecognized parent link {}".format(config.parent_link)
             assert key_links is None or all(lid >= 0 for lid in key_links)
             assert parent_link is None or parent_link >= 0
             config.parent_link = parent_link
@@ -552,7 +576,7 @@ class ICCGANHumanoid(Env):
 
         if max_ob_horizon != self.state_hist.size(0):
             self.state_hist = torch.zeros((max_ob_horizon, *self.state_hist.shape[1:]),
-                dtype=self.root_tensor.dtype, device=self.device)
+                dtype=self.state_hist.dtype, device=self.device)
         if self.reward_weights is None:
             self.reward_weights = torch.ones((self.n_envs, 1), dtype=torch.float, device=self.device)
         elif self.rew_dim > 0:
@@ -561,13 +585,13 @@ class ICCGANHumanoid(Env):
             else:
                 self.reward_weights *= (1-reward_weights)
             self.reward_weights[:, -self.rew_dim:] = reward_weights
-        
-        self.info["ob_seq_lens"] = torch.zeros_like(self.lifetime)  # dummy result
+
+        self.info["ob_seq_lens"] = torch.zeros_like(self.lifetime)
         self.goal_dim = self.get_goal_dim()
         self.state_dim = (self.ob_dim-self.goal_dim)//self.ob_horizon
         if self.discriminators:
-            self.info["disc_obs"] = self.observe_disc(self.state_hist)  # dummy result
-            self.info["disc_obs_expert"] = self.info["disc_obs"]        # dummy result
+            self.info["disc_obs"] = self.observe_disc(self.state_hist)
+            self.info["disc_obs_expert"] = self.info["disc_obs"]
             self.disc_dim = {
                 name: ob.size(-1)
                 for name, ob in self.info["disc_obs"].items()
@@ -584,12 +608,17 @@ class ICCGANHumanoid(Env):
 
     def get_goal_dim(self):
         return self.GOAL_DIM
-    
+
     def get_goal_tensor_dim(self):
         return self.GOAL_TENSOR_DIM
 
     def build_motion_lib(self, motion_file: Union[str, Sequence[str]]):
-        return ReferenceMotion(motion_file=motion_file, character_model=self.character_model, device=self.device)
+        # ReferenceMotion takes character_model only as opaque metadata; if
+        # we were given a list of MJCFs we hand it the primary one (the arm).
+        cm = self.character_model
+        if not isinstance(cm, (str, os.PathLike)):
+            cm = str(list(cm)[0])
+        return ReferenceMotion(motion_file=motion_file, character_model=cm, device=self.device)
 
     def __del__(self):
         if hasattr(self, "sampling_workers"):
@@ -607,7 +636,10 @@ class ICCGANHumanoid(Env):
 
     def reset(self):
         if self.goal_tensor is not None:
-            self.goal_tensor.zero_()
+            if torch.is_tensor(self.goal_tensor):
+                self.goal_tensor.zero_()
+            else:
+                for t in self.goal_tensor: t.zero_()
             if self.goal_timer is not None: self.goal_timer.zero_()
         super().reset()
 
@@ -633,13 +665,26 @@ class ICCGANHumanoid(Env):
             if len(env_ids) > 0: self.reset_goal(env_ids)
         return overtime
 
+    def _ground_contact_test_sim(self):
+        # Any contact between the ground (geom 0) and a geom outside the
+        # contactable links within 1cm. The scatter keeps the test on the
+        # device without a host sync.
+        geom, dist, worldid, valid = self.sim.contacts()
+        g1, g2 = geom[:, 0], geom[:, 1]
+        contact1 = (g1 == 0).logical_and_(~torch.isin(g2, self._contactable_geoms))
+        contact2 = (g2 == 0).logical_and_(~torch.isin(g1, self._contactable_geoms))
+        hit = contact1.logical_or_(contact2).logical_and_(dist < 0.01).logical_and_(valid)
+        terminate = torch.zeros(self.n_envs, dtype=torch.int32, device=self.device)
+        terminate.scatter_reduce_(0, worldid.to(torch.int64).clip_(0, self.n_envs-1), hit.to(torch.int32), reduce="amax")
+        return terminate.to(torch.bool)
+
     def termination_check(self):
         if self._ground_contact_test is None:
             return torch.zeros_like(self.done)
-        terminate = jax2torch(self._ground_contact_test(self.mjx_data), device=self.device)
+        terminate = self._ground_contact_test()
         terminate *= (self.lifetime > 1)
         return terminate
-    
+
     def init_state(self, env_ids):
         motion_ids, motion_times = self.ref_motion.sample(len(env_ids))
         ref_link_tensor, ref_joint_tensor = self.ref_motion.state(motion_ids, motion_times, with_joint_tensor=True)
@@ -647,22 +692,22 @@ class ICCGANHumanoid(Env):
 
     def prepare_sim(self, opt={}):
         super().prepare_sim(opt)
-        n_links = self.mj_model.nbody - 1  # exclude world body
+        n_links = self.mj_model.nbody - 1
         self.state_hist = torch.empty((self.ob_horizon+1, self.n_envs, n_links*13),
             dtype=torch.float, device=self.device)
 
         if self.key_links is not None:
             key_links = []
             for link in self.key_links:
-                lid = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, link)-1 # exclude world body
-                assert lid != -1, "Unrecognized key link {}".format(link)
+                lid = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, link)-1
+                assert lid >= 0, "Unrecognized key link {}".format(link)
                 key_links.append(lid)
             self.key_links = sorted(key_links)
         if self.parent_link is not None:
-            parent_link = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, self.parent_link)-1 # exclude world body
-            assert parent_link != -1, "Unrecognized parent link {}".format(parent_link)
+            parent_link = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, self.parent_link)-1
+            assert parent_link >= 0, "Unrecognized parent link {}".format(self.parent_link)
             self.parent_link = parent_link
-        
+
         if self.goal_tensor_dim:
             try:
                 self.goal_tensor = [
@@ -680,52 +725,69 @@ class ICCGANHumanoid(Env):
         n_envs = self.n_envs
         if env_ids is None or len(env_ids) == n_envs:
             self.state_hist[:-1] = self.state_hist[1:].clone()
-            self.state_hist[-1] = self.link_tensor.view(n_envs, -1)
+            self.state_hist[-1] = self.link_tensor.reshape(n_envs, -1)
             env_ids = None
         else:
             self.state_hist[:-1, env_ids] = self.state_hist[1:, env_ids].clone()
-            self.state_hist[-1, env_ids] = self.link_tensor[env_ids].view(len(env_ids), -1)
+            self.state_hist[-1, env_ids] = self.link_tensor[env_ids].reshape(len(env_ids), -1)
         return self._observe(env_ids)
 
     def _observe(self, env_ids):
         if env_ids is None:
             ob = observe_iccgan(
                 self.state_hist[-self.ob_horizon:], self.ob_seq_lens, self.key_links, self.parent_link,
-                include_vel=self.include_vel, local_pos=self.local_pos, global_pos=self.global_pos
+                include_vel=self.include_vel, local_pos=self.local_pos, global_pos=self.global_pos,
+                key_link_index=self._key_link_index(self.key_links)
             )
         else:
             ob = observe_iccgan(
                 self.state_hist[-self.ob_horizon:, env_ids], self.ob_seq_lens[env_ids], self.key_links, self.parent_link,
-                include_vel=self.include_vel, local_pos=self.local_pos, global_pos=self.global_pos
+                include_vel=self.include_vel, local_pos=self.local_pos, global_pos=self.global_pos,
+                key_link_index=self._key_link_index(self.key_links)
             )
         return ob.flatten(start_dim=1)
+
+    def _key_link_index(self, key_links):
+        """key_links as a device tensor, built once per list."""
+        if key_links is None:
+            return None
+        cache = self.__dict__.setdefault("_key_link_index_cache", {})
+        k = tuple(key_links)
+        if k not in cache:
+            cache[k] = torch.tensor(key_links, dtype=torch.int64, device=self.device)
+        return cache[k]
 
     def observe_disc(self, state):
         seq_len = self.info["ob_seq_lens"]+1
         res = dict()
         if torch.is_tensor(state):
-            # fake, simulated
             for id, disc in self.discriminators.items():
                 res[id] = observe_iccgan(state[-disc.ob_horizon:], seq_len, disc.key_links, disc.parent_link,
-                    include_vel=False, local_pos=disc.local_pos, global_pos=disc.global_pos)
+                    include_vel=False, local_pos=disc.local_pos, global_pos=disc.global_pos,
+                    key_link_index=self._key_link_index(disc.key_links))
             return res
         else:
             assert False
-            # real, reference
-            for disc_name, s in state.items():
-                disc = self.discriminators[disc_name]
-                res[disc_name] = observe_iccgan(s[-disc.ob_horizon:], None, disc.key_links, disc.parent_link,
-                    include_vel=False, local_pos=disc.local_pos, global_pos=disc.global_pos)
-            return res
 
     def fetch_real_samples(self):
         if not self.real_samples:
             if not self.sampling_workers:
                 self.disc_ref_motion = {}
                 import torch.multiprocessing as mp
-                mp.set_start_method("spawn")
-                manager = mp.Manager()
+                if mp.get_start_method(allow_none=True) != "spawn":
+                    mp.set_start_method("spawn", force=True)
+                # Workers and the queue manager exit on their own when this
+                # process dies without running its cleanup (SIGTERM/SIGKILL,
+                # os._exit); otherwise they would keep their GPU memory.
+                from multiprocessing.managers import SyncManager
+                manager = SyncManager(ctx=mp.get_context("spawn"))
+                manager.start(_sampling_manager_init, (os.getpid(),))
+                self._sampling_manager = manager
                 seed = np.random.get_state()[1][0]
+                # ReferenceMotion takes character_model only as opaque metadata (see build_motion_lib)
+                character_model = self.character_model
+                if not isinstance(character_model, (str, os.PathLike)):
+                    character_model = str(list(character_model)[0])
                 for n, config in self.discriminators.items():
                     q = manager.Queue(maxsize=1)
                     self.disc_ref_motion[n] = q
@@ -755,9 +817,9 @@ class ICCGANHumanoid(Env):
                     if config.key_link_index_offset is not None:
                         key_links = [_+config.key_link_index_offset for _ in key_links]
 
-                    p = mp.Process(target=self.__class__.ref_motion_sample, args=(q,
+                    p = mp.Process(target=self.__class__.ref_motion_sample, daemon=True, args=(os.getpid(), q,
                         seed+1+config.id, self.step_time, self.n_envs, config.ob_horizon, key_links_index, parent_link_index, config.local_pos, config.global_pos, config.replay_speed,
-                        dict(motion_file=config.motion_file, character_model=self.character_model,
+                        dict(motion_file=config.motion_file, character_model=character_model,
                             key_links=key_links, device=self.device
                         )
                     ))
@@ -766,12 +828,31 @@ class ICCGANHumanoid(Env):
 
             self.real_samples = [{n: None for n in self.disc_ref_motion.keys()} for _ in range(128)]
             for n, q in self.disc_ref_motion.items():
-                for i, v in enumerate(q.get()):
+                try:
+                    batch = q.get()
+                except (OSError, EOFError) as e:  # BrokenPipeError and ConnectionError are OSError
+                    self._report_sampling_failure(n, e)
+                    raise
+                for i, v in enumerate(batch):
                     self.real_samples[i][n] = v.to(self.device)
         return self.real_samples.pop()
 
+    def _report_sampling_failure(self, name, error):
+        # Exit codes: None = still alive, 0 = clean exit (for example the
+        # parent watchdog), 1 = uncaught exception, -N = killed by signal N.
+        lines = ["Reference motion queue '{}' failed: {!r}".format(name, error)]
+        proc = getattr(getattr(self, "_sampling_manager", None), "_process", None)
+        if proc is not None:
+            lines.append("  queue manager pid {} exitcode {}".format(proc.pid, proc.exitcode))
+        for n, p in zip(self.disc_ref_motion.keys(), self.sampling_workers):
+            lines.append("  sampling worker '{}' pid {} exitcode {}".format(n, p.pid, p.exitcode))
+        print("\n".join(lines), file=sys.stderr, flush=True)
+
     @staticmethod
-    def ref_motion_sample(queue, seed, step_time, n_inst, ob_horizon, key_links, parent_link, local_pos, global_pos, replay_speed, kwargs):
+    def ref_motion_sample(parent_pid, queue, seed, step_time, n_inst, ob_horizon, key_links, parent_link, local_pos, global_pos, replay_speed, kwargs):
+        import faulthandler
+        faulthandler.enable()
+        _exit_with_parent(parent_pid, name="sampling worker")
         np.random.seed(seed)
         torch.set_num_threads(1)
         lib = ReferenceMotion(**kwargs)
@@ -793,93 +874,111 @@ class ICCGANHumanoid(Env):
                 obs.append(ob.cpu())
             queue.put(obs)
 
+
+def _sampling_manager_init(parent_pid):
+    """Initializer of the reference motion queue manager process."""
+    import faulthandler, logging
+    import multiprocessing.util
+    faulthandler.enable()  # print a traceback on SIGSEGV/SIGABRT
+    # managers.py reports a failed client connection only through this logger
+    multiprocessing.util.log_to_stderr(logging.INFO)
+    _exit_with_parent(parent_pid, name="queue manager")
+
+
+def _exit_with_parent(parent_pid, interval=5.0, name=None):
+    """In a child process: exit as soon as the parent process is gone."""
+    import threading
+    def watch():
+        while True:
+            time.sleep(interval)
+            if os.getppid() != parent_pid:
+                if name is not None:
+                    print("{} (pid {}): parent {} is gone, exit".format(name, os.getpid(), parent_pid), file=sys.stderr, flush=True)
+                os._exit(0)
+    threading.Thread(target=watch, daemon=True).start()
+
+
 @torch.jit.script
 def observe_iccgan(state_hist: torch.Tensor, seq_len: Optional[torch.Tensor]=None,
     key_links: Optional[List[int]]=None, parent_link: Optional[int]=None,
     include_vel: bool=True, local_pos: Optional[bool]=None, global_pos: bool=False,
-    ground_height:Optional[torch.Tensor]=None
+    ground_height:Optional[torch.Tensor]=None, key_link_index: Optional[torch.Tensor]=None
 ):
-    # state_hist: L x N x (1+N_links) x 13
-
+    # key_link_index: key_links as a tensor on the state's device. Selecting with
+    # it avoids copying the Python list to the GPU (a host sync) on every call.
     UP_AXIS = 2
     n_hist = state_hist.size(0)
     n_inst = state_hist.size(1)
 
     link_tensor = state_hist.view(n_hist, n_inst, -1, 13)
-    if global_pos:
-        if key_links is None:
-            if include_vel:
-                ob = link_tensor
-            else:
-                ob = link_tensor[...,:7]
-        else:
-            if include_vel:
-                ob = link_tensor[:,:,key_links]
-            else:
-                ob = link_tensor[:,:,key_links,:7]
+    if key_links is None:
+        key_link_tensor = link_tensor
+    elif key_link_index is not None:
+        key_link_tensor = link_tensor.index_select(2, key_link_index)
     else:
-        if key_links is None:
-            link_pos, link_orient = link_tensor[...,:3], link_tensor[...,3:7]
+        key_link_tensor = link_tensor[:,:,key_links]
+    if global_pos:
+        if include_vel:
+            ob = key_link_tensor
         else:
-            link_pos, link_orient = link_tensor[:,:,key_links,:3], link_tensor[:,:,key_links,3:7]
+            ob = key_link_tensor[...,:7]
+    else:
+        link_pos, link_orient = key_link_tensor[...,:3], key_link_tensor[...,3:7]
         if parent_link is None:
             root_tensor = state_hist[..., :13]
             if local_pos is True:
-                origin = root_tensor[:,:, :3]          # L x N x 3
-                orient = root_tensor[:,:,3:7]          # L x N x 4
+                origin = root_tensor[:,:, :3]
+                orient = root_tensor[:,:,3:7]
             else:
-                origin = root_tensor[-1,:, :3]          # N x 3
-                orient = root_tensor[-1,:,3:7]          # N x 4
+                origin = root_tensor[-1,:, :3]
+                orient = root_tensor[-1,:,3:7]
 
-            heading = heading_zup(orient)               # (L x) N
+            heading = heading_zup(orient)
             up_dir = torch.zeros_like(origin)
-            up_dir[..., UP_AXIS] = 1                    # (L x) N x 3
-            orient_inv = axang2quat(up_dir, -heading)   # (L x) N x 4
-            orient_inv = orient_inv.view(-1, n_inst, 1, 4)   # L x N x 1 x 4 or 1 x N x 1 x 4
+            up_dir[..., UP_AXIS] = 1
+            orient_inv = axang2quat(up_dir, -heading)
+            orient_inv = orient_inv.view(-1, n_inst, 1, 4)
 
             origin = origin.clone()
             if ground_height is None:
-                origin[..., UP_AXIS] = 0                # (L x) N x 3
+                origin[..., UP_AXIS] = 0
             else:
-                origin[..., UP_AXIS] = ground_height    # (L x) N x 3
-            origin.unsqueeze_(-2)                       # (L x) N x 1 x 3
+                origin[..., UP_AXIS] = ground_height
+            origin.unsqueeze_(-2)
         else:
             if local_pos is False:
-                origin = link_tensor[-1,:, parent_link, :3]  # N x 3
-                orient = link_tensor[-1,:, parent_link,3:7]  # N x 4
+                origin = link_tensor[-1,:, parent_link, :3]
+                orient = link_tensor[-1,:, parent_link,3:7]
             else:
-                origin = link_tensor[:,:, parent_link, :3]  # L x N x 3
-                orient = link_tensor[:,:, parent_link,3:7]  # L x N x 4
-            orient_inv = quatconj(orient)               # L x N x 4
-            orient_inv = orient_inv.view(-1, n_inst, 1, 4)  # L x N x 1 x 4 or 1 x N x 1 x 4
-            origin = origin.unsqueeze(-2)               # (L x) N x 1 x 3
+                origin = link_tensor[:,:, parent_link, :3]
+                orient = link_tensor[:,:, parent_link,3:7]
+            orient_inv = quatconj(orient)
+            orient_inv = orient_inv.view(-1, n_inst, 1, 4)
+            origin = origin.unsqueeze(-2)
 
-        ob_link_pos = link_pos - origin                                     # L x N x n_links x 3 
+        ob_link_pos = link_pos - origin
         ob_link_pos = rotatepoint(orient_inv, ob_link_pos)
-        ob_link_orient = quatmultiply(orient_inv, link_orient)  # L x N x n_links x 4
+        ob_link_orient = quatmultiply(orient_inv, link_orient)
 
         if include_vel:
-            if key_links is None:
-                link_lin_vel, link_ang_vel = link_tensor[...,7:10], link_tensor[...,10:13]
-            else:
-                link_lin_vel, link_ang_vel = link_tensor[:,:,key_links,7:10], link_tensor[:,:,key_links,10:13]
-            ob_link_lin_vel = rotatepoint(orient_inv, link_lin_vel)         # L x N x n_links x 3
-            ob_link_ang_vel = rotatepoint(orient_inv, link_ang_vel)         # L x N x n_links x 3
+            link_lin_vel, link_ang_vel = key_link_tensor[...,7:10], key_link_tensor[...,10:13]
+            ob_link_lin_vel = rotatepoint(orient_inv, link_lin_vel)
+            ob_link_ang_vel = rotatepoint(orient_inv, link_ang_vel)
             ob = torch.cat((ob_link_pos, ob_link_orient,
-                ob_link_lin_vel, ob_link_ang_vel), -1)                      # L x N x n_links x 13
+                ob_link_lin_vel, ob_link_ang_vel), -1)
         else:
-            ob = torch.cat((ob_link_pos, ob_link_orient), -1)               # L x N x n_links x 7
-    # ob = ob.view(n_hist, n_inst, -1)                                    # L x N x (n_links x 7 or 13)
+            ob = torch.cat((ob_link_pos, ob_link_orient), -1)
     ob = torch.reshape(ob, (n_hist, n_inst, -1))
-    ob1 = ob.permute(1, 0, 2)                                           # N x L x (n_links x 7 or 13)
+    ob1 = ob.permute(1, 0, 2)
     if seq_len is None: return ob1
 
-    ob2 = torch.zeros_like(ob1)
     arange = torch.arange(n_hist, dtype=seq_len.dtype, device=seq_len.device).unsqueeze_(0)
-    seq_len_ = seq_len.unsqueeze(1)
-    mask1 = arange > (n_hist-1) - seq_len_
-    mask2 = arange < seq_len_
-    ob2[mask2] = ob1[mask1]
+    # Move the last min(seq_len, n_hist) frames of each instance to the front and
+    # zero the rest. A gather, unlike boolean-mask indexing, needs no host sync.
+    seq_len_ = seq_len.clamp(max=n_hist).unsqueeze(1)
+    src = (arange + (n_hist - seq_len_)).clamp_(min=0, max=n_hist-1)
+    ob2 = torch.gather(ob1, 1, src.unsqueeze(-1).expand(-1, -1, ob1.size(-1)))
+    ob2 = ob2.masked_fill((arange >= seq_len_).unsqueeze(-1), 0.)
     return ob2
 
 
@@ -897,6 +996,14 @@ class PianoBase(ICCGANHumanoid):
         self.max_note_t2 = max_note_t//2
 
         self.n_keys = kwargs.get("n_keys", self.N_KEYS)
+        self.enable_audio = kwargs.get("enable_audio", True)
+        self.audio_gain = kwargs.get("audio_gain", 0.16)
+        self.audio_backend = kwargs.get("audio_backend", "auto")
+        self.audio_reverb = kwargs.get("audio_reverb", 0.3)
+        self._piano_audio = None
+        self._audio_key_state = None
+        self._audio_key_position = None
+        self._audio_warning_printed = False
         
         self.random_init_note = kwargs.get("random_init_note", True)
         self.random_init = False # for self.reset_envs()
@@ -1000,8 +1107,74 @@ class PianoBase(ICCGANHumanoid):
             self.info["log"]["acc_rew0"] = self.average_reward[0]
             self.info["log"]["acc_rew_low"] = torch.min(self.average_reward)
 
-        
-    def _put_to_mjx(self):
+    def __del__(self):
+        audio = getattr(self, "_piano_audio", None)
+        if audio is not None:
+            audio.close()
+        super().__del__()
+
+    def _start_audio(self):
+        if not self.enable_audio or self._piano_audio is not None:
+            return
+        try:
+            from piano_audio import PianoAudio
+
+            audio = PianoAudio(
+                gain=self.audio_gain,
+                backend=self.audio_backend,
+                reverb=self.audio_reverb,
+            )
+            if audio.available:
+                self._piano_audio = audio
+                print("Piano audio backend: {}.".format(audio.backend))
+            elif not self._audio_warning_printed:
+                print("Piano audio disabled: {}".format(audio.error))
+                self._audio_warning_printed = True
+                self.enable_audio = False
+        except Exception as exc:
+            if not self._audio_warning_printed:
+                print("Piano audio disabled: {}".format(exc))
+                self._audio_warning_printed = True
+            self.enable_audio = False
+
+    def _play_audio_for_pressed_keys(self, key_activated):
+        if not self.enable_audio:
+            return
+        key_pos = self.key_pos[0].detach().cpu().numpy()
+        if self._audio_key_state is None:
+            self._audio_key_state = key_activated.copy()
+            self._audio_key_position = key_pos.copy()
+            return
+        self._start_audio()
+        audio = self._piano_audio
+        if audio is None:
+            self._audio_key_state = key_activated.copy()
+            self._audio_key_position = key_pos.copy()
+            return
+
+        # The audio follows the env's own press state (key_activated). Each
+        # release that the env counts, even for one frame, gives a new note on
+        # the next press.
+        audio_key_state = np.asarray(key_activated, dtype=bool).copy()
+        pressed = np.logical_and(audio_key_state, np.logical_not(self._audio_key_state))
+        released = np.logical_and(self._audio_key_state, np.logical_not(audio_key_state))
+        for key in np.flatnonzero(released):
+            audio.release_key(int(key))
+
+        if np.any(pressed):
+            previous_pos = self._audio_key_position
+            if previous_pos is None:
+                previous_pos = key_pos
+            press_speed = np.maximum(key_pos - previous_pos, 0) * self.fps
+            for key in np.flatnonzero(pressed):
+                velocity = 0.18 + 0.82 * (
+                    1.0 - math.exp(-float(press_speed[key]) / 8.0)
+                )
+                audio.play_key(int(key), velocity=velocity)
+        self._audio_key_state = audio_key_state
+        self._audio_key_position = key_pos.copy()
+
+    def _make_simulator(self):
         self.goal_note_tensor = torch.zeros((self.n_envs, self.goal_horizon, self.n_keys), dtype=torch.int32, device=self.device)
         self.goal_t_tensor = torch.empty((self.n_envs, self.goal_horizon), dtype=torch.int32, device=self.device)
         self.sampling_track_id = torch.empty((self.n_envs,), dtype=torch.int64, device=self.device)
@@ -1022,352 +1195,20 @@ class PianoBase(ICCGANHumanoid):
 
         self.load_note(self.note_file)
 
-        valid_keys = torch.nonzero(torch.any(self.track_note_tensor.view(-1, self.track_note_tensor.size(-1)) != 0, 0)).cpu().squeeze_(-1).tolist()
-        valid_keys = np.unique(sum([[k-2,k-1,k,k+1,k+2] for k in valid_keys], []))
-        for i in range(self.mj_model.ngeom):
-            g = self.mj_model.geom(i)
-            if "P:" in g.name and "key" in g.name:
-                g.conaffinity[:]=0
-                if any(g.name.endswith("key_{}".format(idx)) for idx in valid_keys):
-                    pass
-                else:
-                    g.contype[:] = 0
-
-        mjx_data = mjx.put_data(self.mj_model, self.mj_data, device=self.jax_device)
-        mjx_model = mjx.put_model(self.mj_model, device=self.jax_device)
-
-
-        from mujoco.mjx._src.types import Model
-        from mujoco.mjx._src.types import Data
-        from mujoco.mjx._src.types import ModelJAX
-        from mujoco.mjx._src.types import DataJAX
-
-        from mujoco.mjx._src import solver
-        from mujoco.mjx._src import smooth
-        from mujoco.mjx._src import constraint
-        from mujoco.mjx._src.forward import fwd_velocity, fwd_actuation, fwd_acceleration
-        from mujoco.mjx._src.forward import euler
-
-        from mujoco.mjx._src.collision_types import FunctionKey
-        from mujoco.mjx._src.collision_driver import _numeric
-        from mujoco.mjx._src.collision_driver import _GEOM_NO_BROADPHASE, _COLLISION_FUNC
-
-        from mujoco.mjx._src.collision_driver import _contact_groups
-        contact_groups = _contact_groups(mjx_model, mjx_data)
-        contact_groups_keys = tuple((k.types, k.data_ids, k.condim) for k, v in contact_groups.items())
-        contact_groups_values = tuple(v for k, v in contact_groups.items())
-
-        max_geom_pairs = _numeric(mjx_model, 'max_geom_pairs')
-        max_contact_points = _numeric(mjx_model, 'max_contact_points')
-
-        piano_key_geoms = sorted(i for i in range(self.mj_model.ngeom) if "P:" in self.mj_model.geom(i).name and "key" in self.mj_model.geom(i).name)
-        key_edge0, key_edge1 = [], []
-        key_center = []
-        for gid in piano_key_geoms:
-            g = self.mj_model.geom(gid)
-            b = self.mj_model.body(g.bodyid.item())
-            key_edge0.append(b.pos[0]+g.pos[0]-g.size[0]-0.01)
-            key_edge1.append(b.pos[0]+g.pos[0]+g.size[0]+0.01)
-            key_center.append(b.pos[0]+g.pos[0])
-
-        key_edge0[-1] = -10000000
-        key_edge1[0]  = 10000000
-        key_edge0 = jnp.array([key_edge0], device=self.jax_device)    # 1 x N_keys
-        key_edge1 = jnp.array([key_edge1], device=self.jax_device)
-        key_center = jnp.array([key_center], device=self.jax_device)
-
-        self.piano_key_geoms = torch.tensor(piano_key_geoms, device=self.device, dtype=torch.int32)
-
-        left_finger = self.mj_model.body(finger_tips[0]+1).parentid if finger_tips[0] else -1
-        right_finger = self.mj_model.body(finger_tips[-1]+1).parentid if finger_tips[-1] else -1
-
-        conaffinity_left_finger = None
-        conaffinity_right_finger = None
-        for i in range(self.mj_model.ngeom):
-            g = self.mj_model.geom(i)
-            conaffinity = g.conaffinity.item()
-            if g.bodyid == left_finger:
-                if conaffinity:
-                    assert conaffinity_left_finger == None
-                    conaffinity_left_finger = conaffinity
-            elif g.bodyid == right_finger:
-                if conaffinity:
-                    assert conaffinity_right_finger == None
-                    conaffinity_right_finger = conaffinity
-
-        assert conaffinity_left_finger == 1 or conaffinity_left_finger is None
-        assert conaffinity_right_finger == 8 or conaffinity_right_finger is None
-        assert conaffinity_left_finger is None or conaffinity_right_finger or conaffinity_left_finger&conaffinity_left_finger==0
-
-        
-        left_finger_geoms = []
-        right_finger_geoms = []
-        for i in range(self.mj_model.ngeom):
-            g = self.mj_model.geom(i)
-            conaffinity = g.conaffinity.item()
-            if conaffinity_left_finger is not None and conaffinity == conaffinity_left_finger:
-                gid = g.id
-                if gid not in left_finger_geoms:
-                    left_finger_geoms.append(gid)
-            elif conaffinity_right_finger is not None and conaffinity == conaffinity_right_finger:
-                gid = g.id
-                if gid not in right_finger_geoms:
-                    right_finger_geoms.append(gid)
-        assert len(left_finger_geoms) == 0 or len(right_finger_geoms) == 0 or len(left_finger_geoms) == len(right_finger_geoms), "{} vs {}".format(len(left_finger_geoms), len(right_finger_geoms))
-
-
-        last_left_finger_geom = max(left_finger_geoms) if len(left_finger_geoms) else None
-        first_right_finger_geom = min(right_finger_geoms) if len(right_finger_geoms) else None
-        first_key_geom = piano_key_geoms[0]
-
-        max_contact_key_span = 18
-        max_contact_key_span_by2 = 9
-        max_contact_key_finger_pairs = (len(left_finger_geoms) + len(right_finger_geoms)) * max_contact_key_span
-        n_keys_ = self.n_keys - max_contact_key_span
-        
-        contact = None
-        for k, v in zip(contact_groups_keys, contact_groups_values):
-            if k[0][0] == 3 and k[0][1] == 6:
-                contact = v
-                break
-        
-        if contact is not None:
-            left_finger_geom_offset = None if last_left_finger_geom is None else jnp.clip(last_left_finger_geom - contact.geom1, -1000, 0)
-            right_finger_geom_offset = None if first_right_finger_geom is None else jnp.clip(contact.geom1-first_right_finger_geom, -1000, 0)
-            key_geom_offset1 = max_contact_key_span + first_key_geom - contact.geom2
-            key_geom_offset2 = contact.geom2 - first_key_geom + 1
-
-            n_valid_keys = len(valid_keys)
-            if n_valid_keys <= max_contact_key_span:
-                def finger_key_contact_group_filter(d: Data):
-                    return None
-            if left_finger_geom_offset is None:
-                def finger_key_contact_group_filter(d: Data):
-                    x = d.geom_xpos[right_finger_geoms, 0]
-                    # x1 = jnp.max(x, keepdims=True) + 0.05
-                    # right_key0 = jnp.min(jnp.where(jnp.logical_and(key_edge0 < x1, key_edge1 >= x1),
-                    #         key_arange, 1000))
-
-                    x1 = (jnp.max(x, keepdims=True) + jnp.min(x, keepdims=True))*0.5
-                    right_key0 = jnp.argmin(jnp.abs(x1-key_center)) - max_contact_key_span_by2
-
-                    right_key0 = jnp.clip(right_key0, 0, n_keys_)
-                    # contact.geom1 > last_left_finger_geom
-                    # contact.geom2 >= right_key0
-                    # contact.geom2 <  right_key0+max_contact_key_span
-                    before = jnp.clip(right_key0 + key_geom_offset1, -1000, max_contact_key_span)
-                    after = jnp.clip(key_geom_offset2 - right_key0, -1000, max_contact_key_span)
-                    id_err2 = right_finger_geom_offset + before + after 
-                    # _, idx2 = jax.lax.top_k(id_err2, k=300)
-                    # idx = jnp.concatenate((idx1, idx2))
-                    _, idx = jax.lax.top_k(id_err2, k=max_contact_key_finger_pairs)
-                    return idx
-            elif right_finger_geom_offset is None:
-                def finger_key_contact_group_filter(d: Data):
-                    x = d.geom_xpos[left_finger_geoms, 0]
-                    x1 = (jnp.max(x, keepdims=True) + jnp.min(x, keepdims=True))*0.5
-                    left_key0 = jnp.argmin(jnp.abs(x1-key_center)) - max_contact_key_span_by2
-
-                    left_key0 = jnp.clip(left_key0, 0, n_keys_)
-                    before = jnp.clip(left_key0 + key_geom_offset1, -1000, max_contact_key_span)
-                    after = jnp.clip(key_geom_offset2 - left_key0, -1000, max_contact_key_span)
-                    id_err1 = left_finger_geom_offset + before + after
-                    _, idx = jax.lax.top_k(id_err1, k=max_contact_key_finger_pairs)
-                    return idx
-            else:
-                def finger_key_contact_group_filter(d: Data):
-                    x = d.geom_xpos[left_finger_geoms, 0]
-                    x1 = (jnp.max(x, keepdims=True) + jnp.min(x, keepdims=True))*0.5
-                    left_key0 = jnp.argmin(jnp.abs(x1-key_center)) - max_contact_key_span_by2
-
-                    left_key0 = jnp.clip(left_key0, 0, n_keys_)
-                    before = jnp.clip(left_key0 + key_geom_offset1, -1000, max_contact_key_span)
-                    after = jnp.clip(key_geom_offset2 - left_key0, -1000, max_contact_key_span)
-                    id_err1 = jnp.clip(left_finger_geom_offset + before + after, 0, 10000)
-                
-                    x = d.geom_xpos[right_finger_geoms, 0]
-                    x1 = (jnp.max(x, keepdims=True) + jnp.min(x, keepdims=True))*0.5
-                    right_key0 = jnp.argmin(jnp.abs(x1-key_center)) - max_contact_key_span_by2
-
-                    right_key0 = jnp.clip(right_key0, 0, n_keys_)
-                    before = jnp.clip(right_key0 + key_geom_offset1, -1000, max_contact_key_span)
-                    after = jnp.clip(key_geom_offset2 - right_key0, -1000, max_contact_key_span)
-                    id_err2 = jnp.clip(right_finger_geom_offset + before + after, 0, 10000)
-
-                    id_err = id_err1 + id_err2
-                    _, idx = jax.lax.top_k(id_err, k=max_contact_key_finger_pairs)
-                    return idx
-            
-
-        def collision(m: Model, d: Data) -> Data:
-            """Collides geometries."""
-            if not isinstance(m._impl, ModelJAX) or not isinstance(d._impl, DataJAX):
-                raise ValueError('collision requires JAX backend implementation.')
-
-            if d._impl.ncon == 0:  # pytype: disable=attribute-error
-                return d
-
-            # groups = _contact_groups(m, d)
-            # for key, contact in groups.items():
-
-            # run collision functions on groups
-            groups = {}
-            for key, contact in zip(contact_groups_keys, contact_groups_values):
-                key = FunctionKey(key[0], key[1], key[2])
-                # capsule vs box
-                # finger vs key
-                if key.types[0] == 3 and key.types[1] == 6:
-                    if contact.geom.shape[0] > max_geom_pairs:
-                        if n_valid_keys > max_geom_pairs:
-                            idx = finger_key_contact_group_filter(d)
-
-                            # if (
-                            #     max_geom_pairs > -1
-                            #     and contact.geom.shape[0] > max_geom_pairs
-                            #     and not set(key.types) & _GEOM_NO_BROADPHASE
-                            # ):
-                            geom_pair = contact.geom[idx].T
-                            pos1, pos2 = d.geom_xpos[geom_pair]
-                            size1, size2 = m.geom_rbound[geom_pair]
-                            dist = jax.vmap(jnp.linalg.norm)(pos2 - pos1) - (size1 + size2)
-                            _, idx_ = jax.lax.top_k(-dist, k=max_geom_pairs)
-                            idx = idx[idx_]
-                        else:
-                            geom_pair = contact.geom.T
-                            pos1, pos2 = d.geom_xpos[geom_pair]
-                            size1, size2 = m.geom_rbound[geom_pair]
-                            dist = jax.vmap(jnp.linalg.norm)(pos2 - pos1) - (size1 + size2)
-                            _, idx = jax.lax.top_k(-dist, k=max_geom_pairs)
-                        contact = jax.tree.map(lambda x, idx=idx: x[idx], contact)
-                else:
-                    # determine which contacts we'll use for collision testing by running a
-                    # broad phase cull if requested
-                    if (
-                        max_geom_pairs > -1
-                        and contact.geom.shape[0] > max_geom_pairs
-                        and not set(key.types) & _GEOM_NO_BROADPHASE
-                    ):
-                        pos1, pos2 = d.geom_xpos[contact.geom.T]
-                        size1, size2 = m.geom_rbound[contact.geom.T]
-                        dist = jax.vmap(jnp.linalg.norm)(pos2 - pos1) - (size1 + size2)
-                        _, idx = jax.lax.top_k(-dist, k=max_geom_pairs)
-                        contact = jax.tree_util.tree_map(lambda x, idx=idx: x[idx], contact)
-
-                # run the collision function specified by the grouping key
-                func = _COLLISION_FUNC[key.types]
-                ncon = func.ncon  # pytype: disable=attribute-error
-
-                dist, pos, frame = func(m, d, key, contact.geom)
-                if ncon > 1:
-                    # repeat contacts to match the number of collisions returned
-                    repeat_fn = lambda x, r=ncon: jnp.repeat(x, r, axis=0)
-                    contact = jax.tree_util.tree_map(repeat_fn, contact)
-                groups[key] = contact.replace(dist=dist, pos=pos, frame=frame)
-            
-            # collapse contacts together, ensuring they are grouped by condim
-            condim_groups = {}
-            for key, contact in groups.items():
-                condim_groups.setdefault(key.condim, []).append(contact)
-
-            # limit the number of contacts per condim group if requested
-            if max_contact_points > -1:
-                for key, contacts in condim_groups.items():
-                    contact = jax.tree_util.tree_map(lambda *x: jnp.concatenate(x), *contacts)
-                    if contact.geom.shape[0] > max_contact_points:
-                        _, idx = jax.lax.top_k(-contact.dist, k=max_contact_points)
-                        contact = jax.tree_util.tree_map(lambda x, idx=idx: x[idx], contact)
-                    condim_groups[key] = [contact]
-            contacts = sum([condim_groups[k] for k in sorted(condim_groups)], [])
-            contact = jax.tree_util.tree_map(lambda *x: jnp.concatenate(x), *contacts)
-
-            return d.tree_replace({'_impl.contact': contact})
-
-        def fwd_position(m: Model, d: Data) -> Data:
-            """Position-dependent computations."""
-            
-            d = smooth.kinematics(m, d)
-            d = smooth.com_pos(m, d)
-            # d = smooth.camlight(m, d)
-            d = smooth.tendon(m, d)
-            d = smooth.crb(m, d)
-            d = smooth.tendon_armature(m, d)
-            d = smooth.factor_m(m, d)
-            # d = collision_driver.collision(m, d)
-            d = collision(m, d)
-            d = constraint.make_constraint(m, d)
-            d = smooth.transmission(m, d)
-            return d
-
-        def forward(m: Model, d: Data) -> Data:
-            """Forward dynamics."""
-            d = fwd_position(m, d)
-            # d = sensor.sensor_pos(m, d)
-            d = fwd_velocity(m, d)
-            # d = sensor.sensor_vel(m, d)
-            d = fwd_actuation(m, d)
-            d = fwd_acceleration(m, d)
-            # if d._impl.efc_J.size == 0:
-            #     d = d.replace(qacc=d.qacc_smooth)
-            #     return d
-            d = solver.solve(m, d)
-            # d = sensor.sensor_acc(m, d)
-            return d
-
-        def _step(m: Model, d: Data) -> Data:
-            """Advance simulation."""
-            d = forward(m, d)
-            d = euler(m, d)
-            return d
-        
-        mjx_data = jax.vmap(lambda _, x: x, in_axes=(0, None))(jnp.arange(self.n_envs, device=self.jax_device), mjx_data)
-        self.mjx_step1 = jax.jit(jax.vmap(_step, in_axes=(None, 0)), device=self.jax_device)
-
-        if self.mj_model.ntendon > 0:
-            def _kinematics(m, d):
-                # d = fwd_position(m, d)
-                d = smooth.kinematics(m, d)
-                d = smooth.com_pos(m, d)
-                # d = smooth.camlight(m, d)
-                d = smooth.tendon(m, d)
-                # d = smooth.crb(m, d)
-                # d = smooth.tendon_armature(m, d)
-                # d = smooth.factor_m(m, d)
-                # d = collision_driver.collision(m, d)
-                # d = collision(m, d)
-                # d = constraint.make_constraint(m, d)
-                # d = smooth.transmission(m, d)
-
-                # d = sensor.sensor_pos(m, d)
-                
-                # d = fwd_velocity(m, d)
-                d = d.tree_replace({
-                    '_impl.actuator_velocity': d._impl.actuator_moment @ d.qvel,
-                    '_impl.ten_velocity': d._impl.ten_J @ d.qvel,
-                })
-                d = smooth.com_vel(m, d)
-                # d = passive.passive(m, d)
-                # d = smooth.rne(m, d)
-                d = smooth.tendon_bias(m, d)
-
-                # d = sensor.sensor_vel(m, d)
-                # d = fwd_actuation(m, d)
-                # d = fwd_acceleration(m, d)
-                # if d._impl.efc_J.size == 0:
-                #     d = d.replace(qacc=d.qacc_smooth)
-                #     return d
-                # d = solver.solve(m, d)
-                return d
-            self.mjx_kinematics = jax.jit(jax.vmap(_kinematics, in_axes=(None, 0)), device=self.jax_device)
-        else:
-            self.mjx_kinematics = jax.jit(jax.vmap(lambda model, data: mjx.com_vel(model, mjx.com_pos(model, mjx.kinematics(model, data))), in_axes=(None, 0)), device=self.jax_device)
-
-        self.mjx_data = mjx_data
-        self.mjx_model = mjx_model
+        # The MJX upstream additionally (1) disabled the collision of piano keys
+        # farther than two keys from any key in the loaded notes and
+        # (2) replaced the MJX collision driver with a custom one that culls
+        # finger-key pairs to the keys under each hand before running the
+        # narrow phase. Both only cut the cost of MJX's static, all-pairs
+        # contact enumeration. mujoco_warp's broadphase prunes the pairs per
+        # step, so the model collides as specified by its MJCF and steps
+        # through the standard mujoco_warp pipeline.
+        super()._make_simulator()
 
 
     def prepare_sim(self, opt={}):
-        opt["disableflags"] = 1<<6 + 1<<8 # no gravity, no warmstart
-        opt["gravity"] = [0, 0, 0]
+        opt["disableflags"] = int(mujoco.mjtDisableBit.mjDSBL_GRAVITY) | int(mujoco.mjtDisableBit.mjDSBL_WARMSTART)
+        opt["gravity"] = np.array([0, 0, 0])
         super().prepare_sim(opt)
         self.origin = torch.empty((self.n_envs, 1, 3), dtype=torch.float, device=self.device)
         self.orient = torch.empty((self.n_envs, 1, 4), dtype=torch.float, device=self.device)
@@ -1408,6 +1249,7 @@ class PianoBase(ICCGANHumanoid):
 
         piano_key0_joint = min(i for i in range(self.mj_model.njnt) if "P:" in self.mj_model.joint(i).name and "joint" in self.mj_model.joint(i).name)
         self.piano_key_joints = [self.mj_model.joint(piano_key0_joint).qposadr.item()+i for i in range(self.n_keys)]
+        self.piano_key_joints_tensor = torch.tensor(self.piano_key_joints, dtype=torch.int64, device=self.device)
         self.piano_key_depth = torch.tensor([self.mj_model.joint(piano_key0_joint+i).range[0].item() for i in range(self.n_keys)], dtype=torch.float, device=self.device)
 
         self.arange_tensor_n_envs = torch.arange(self.n_envs, device=self.device)
@@ -1758,11 +1600,17 @@ class PianoBase(ICCGANHumanoid):
                 dt.append(0)
         self.track_note_tensor = torch.tensor(np.array(sum(track, [])), dtype=torch.int32, device=self.device)
         self.track_t_tensor = torch.tensor(sum(t, []), dtype=torch.int32, device=self.device)
-        self.track_tensor_offset = torch.tensor([0]+[len(_) for _ in track[:-1]], dtype=torch.int32, device=self.device)
+        track_offsets = np.cumsum([0] + [len(items) for items in track[:-1]])
+        self.track_tensor_offset = torch.tensor(track_offsets, dtype=torch.int32, device=self.device)
         self.track_n_notes_tensor = torch.tensor([len(_)-self.goal_horizon for _ in track], dtype=torch.int32, device=self.device)
         print("Load {} notes ({:.4f}s) from {} files of {} tracks.".format(sum(len(note) for note in track), sum(sum(dt) for dt in t)/fps, len(note_file), len(track)))
         
     def reset(self):
+        audio = getattr(self, "_piano_audio", None)
+        if audio is not None:
+            audio.all_notes_off()
+        self._audio_key_state = None
+        self._audio_key_position = None
         super().reset()
         self.track_length_tensor = torch.zeros_like(self.track_t_tensor)
         for i in range(len(self.track_tensor_offset)):
@@ -1793,7 +1641,7 @@ class PianoBase(ICCGANHumanoid):
             track_id = self.track_id_tensor[fid]
             note_id = fid - self.track_tensor_offset[track_id]
 
-            self.goal_reset_stamp[env_ids] = self.simulation_step
+            self.goal_reset_stamp.index_fill_(0, env_ids, self.simulation_step)
         else:
             track_id = torch.randint(0, len(self.track_tensor_offset), size=(len(env_ids),), device=self.device)
             phase = torch.rand((n_envs, ), dtype=torch.float, device=self.device).mul_(1.1).sub_(0.1).clip_(min=0)
@@ -1816,32 +1664,29 @@ class PianoBase(ICCGANHumanoid):
         timer = self.track_length_tensor[note_id_] - self.track_length_tensor[note_id]
         timer.add_(self.grace_period)
 
-        # envs under initialization, fill goal tensor, starting with zero note
+        # Envs under initialization (lifetime 0, called from reset_envs) get a new
+        # goal window that starts with a zero note; envs already running (called
+        # when their goal timer expires) shift their window and append a zero note.
+        # Both windows are computed for every env in env_ids and selected per env
+        # with torch.where, so no host sync is needed to split env_ids. As in the
+        # original, one call holds envs of one kind only.
         m = self.lifetime[env_ids]==0
-        env_ids_ = env_ids[m]
-        if len(env_ids_):
-            self.goal_note_tensor[env_ids_, 0, :] = 0
-            self.goal_t_tensor[env_ids_, 0] = self.grace_period
-            for i in range(1, self.goal_horizon):
-                note_id0 = note_id[m]
-                self.goal_note_tensor[env_ids_, i, :] = self.track_note_tensor[note_id0]
-                self.goal_t_tensor[env_ids_, i] = self.track_t_tensor[note_id0]
-                note_id[m] += 1
-        
-        # reset goal for envs that are already initialized, fill zero note at the end of goal tensor
-        if len(env_ids) != len(env_ids_):
-            if len(env_ids_):
-                assert False
-                m.logical_not_()
-                env_ids_ = env_ids[m] 
-                timer[m] += (self.goal_t_tensor[env_ids_].sum(-1)-1)
-            else:
-                env_ids_ = env_ids
-                timer += (self.goal_t_tensor[env_ids].sum(-1)-1)
-            self.goal_note_tensor[env_ids_, :-1] = self.goal_note_tensor[env_ids_, 1:].clone()
-            self.goal_note_tensor[env_ids_, -1, :] = 0
-            self.goal_t_tensor[env_ids_, :-1] = self.goal_t_tensor[env_ids_, 1:].clone()
-            self.goal_t_tensor[env_ids_, -1] = self.grace_period
+        torch._assert_async(m.all().logical_or((~m).all()))
+        H = self.goal_horizon
+        goal_note = self.goal_note_tensor[env_ids]
+        goal_t = self.goal_t_tensor[env_ids]
+        # new window: zero note for grace_period frames, then notes note_id, ..., note_id+H-2
+        window_ids = note_id.unsqueeze(1) + torch.arange(H-1, dtype=note_id.dtype, device=self.device)
+        new_note = torch.cat((torch.zeros_like(goal_note[:, :1]), self.track_note_tensor[window_ids]), 1)
+        new_t = torch.cat((torch.full_like(goal_t[:, :1], self.grace_period), self.track_t_tensor[window_ids]), 1)
+        # running window: drop the first note, append a zero note for grace_period frames
+        shift_note = torch.cat((goal_note[:, 1:], torch.zeros_like(goal_note[:, :1])), 1)
+        shift_t = torch.cat((goal_t[:, 1:], torch.full_like(goal_t[:, :1], self.grace_period)), 1)
+        m_ = m.view(-1, 1)
+        self.goal_note_tensor[env_ids] = torch.where(m_.unsqueeze(-1), new_note, shift_note)
+        self.goal_t_tensor[env_ids] = torch.where(m_, new_t, shift_t)
+        timer = torch.where(m, timer, (timer + (goal_t.sum(-1)-1)).to(timer.dtype))
+        note_id = torch.where(m, note_id + (H-1), note_id)
         self.goal_t_tensor[env_ids, 0] += 1 # observe function will reduce it by 1 directly
 
         self.sampling_note_id[env_ids] = note_id
@@ -1867,8 +1712,8 @@ class PianoBase(ICCGANHumanoid):
                     self.sampling_idx_current = self.sampling_idx.clone()
                 else:
                     m = self.lifetime==0
-                    self.importance_resampling_at_current[m] = self.importance_resampling_at[m]
-                    self.sampling_idx_current[m] = self.sampling_idx[m]
+                    self.importance_resampling_at_current.copy_(torch.where(m, self.importance_resampling_at, self.importance_resampling_at_current))
+                    self.sampling_idx_current.copy_(torch.where(m, self.sampling_idx, self.sampling_idx_current))
 
         else:
             self.episode_length[env_ids] = timer
@@ -1884,6 +1729,19 @@ class PianoBase(ICCGANHumanoid):
         self.goal_t_tensor[env_ids, :-1] = self.goal_t_tensor[env_ids, 1:].clone()
         self.goal_t_tensor[env_ids, -1] = self.track_t_tensor[note_id]
         self.sampling_note_id[env_ids] += 1
+
+    def _update_note_target_masked(self, m):
+        """update_note_target for the envs where the (n_envs,) bool mask m is set,
+        computed for all envs and selected with torch.where (no host sync)."""
+        if self.viewer_pause: return
+        # envs outside m may point one past the last note; their read is discarded
+        note_id = self.sampling_note_id.clamp(max=self.track_note_tensor.size(0)-1)
+        shift_note = torch.cat((self.goal_note_tensor[:, 1:], self.track_note_tensor[note_id].unsqueeze(1)), 1)
+        shift_t = torch.cat((self.goal_t_tensor[:, 1:], self.track_t_tensor[note_id].unsqueeze(1)), 1)
+        m_ = m.view(-1, 1)
+        self.goal_note_tensor.copy_(torch.where(m_.unsqueeze(-1), shift_note, self.goal_note_tensor))
+        self.goal_t_tensor.copy_(torch.where(m_, shift_t, self.goal_t_tensor))
+        self.sampling_note_id += m
 
     def init_state(self, env_ids):
         if self.simulation_step < 1:
@@ -1922,8 +1780,8 @@ class PianoBase(ICCGANHumanoid):
             n_envs = len(env_ids)
             ref_link_tensor = self.ref_link_tensor0[:n_envs]
             ref_joint_tensor = self.ref_joint_tensor0[0][:n_envs], self.ref_joint_tensor0[1][:n_envs]
-        self.key_pos[env_ids, :] = 0
-        self.key_activated[env_ids, :] = False
+        self.key_pos.index_fill_(0, env_ids, 0)
+        self.key_activated.index_fill_(0, env_ids, False)
         return ref_link_tensor, ref_joint_tensor
 
     def get_goal_dim(self):
@@ -1931,39 +1789,42 @@ class PianoBase(ICCGANHumanoid):
 
     def observe(self, env_ids=None):
         if self.simulation_step > 0 and self.training and env_ids is None and self.importance_sampling:
-            need_update_weights = (self.importance_resampling_at_current == self.lifetime).logical_or_((self.lifetime>0).logical_and_(self.done))
-            env_idx = torch.nonzero(need_update_weights).view(-1)
-            if len(env_idx):
-                sid = self.sampling_idx_current[env_idx]
-                idx, cnts = torch.unique(sid, return_counts=True)
-                lifetime = self.simulation_step - self.goal_reset_stamp[env_idx]
-                p = self.cumulative_reward[env_idx]/(self.max_rew-self.boostrap_reward[lifetime]).nan_to_num_(nan=1.)
-                self.cumulative_reward[env_idx] += (~self.info["terminate"][env_idx])*self.boostrap_reward[lifetime]*p
-                self.cumulative_reward_buffer.index_fill_(0, idx, 0)
-                self.cumulative_reward_buffer.index_put_((sid,), self.cumulative_reward[env_idx], accumulate=True)
-                self.average_reward[idx] *= 1-self.importance_decay
-                self.average_reward[idx] += (self.cumulative_reward_buffer[idx]/cnts).mul_(self.importance_decay)
-                self.cumulative_reward.index_fill_(0, env_idx, 0)
-                self.cumulative_reward_discount.index_fill_(0, env_idx, 1)
-                self.info["log"]["acc_rew_low"] = torch.min(self.average_reward)
+            # Update the importance weights of the samples whose episode (or goal
+            # window) ended. Computed for all envs and masked by `w`, with the
+            # same arithmetic as for the selected envs only, so no host sync
+            # (nonzero/unique) is needed.
+            w = (self.importance_resampling_at_current == self.lifetime).logical_or_((self.lifetime>0).logical_and_(self.done))
+            sid = self.sampling_idx_current
+            lifetime = (self.simulation_step - self.goal_reset_stamp).clamp_(min=0, max=self.boostrap_reward.size(0)-1)
+            boot = self.boostrap_reward[lifetime]
+            p = self.cumulative_reward/(self.max_rew-boot).nan_to_num_(nan=1.)
+            cum = self.cumulative_reward + (~self.info["terminate"])*boot*p
+            cnts = torch.zeros_like(self.average_reward, dtype=torch.int64).index_put_((sid,), w.to(torch.int64), accumulate=True)
+            buf = torch.zeros_like(self.cumulative_reward_buffer).index_put_((sid,), torch.where(w, cum, 0.), accumulate=True)
+            touched = cnts > 0
+            self.cumulative_reward_buffer.copy_(torch.where(touched, buf, self.cumulative_reward_buffer))
+            average_reward = self.average_reward*(1-self.importance_decay)
+            average_reward += (buf/cnts).mul_(self.importance_decay)
+            self.average_reward.copy_(torch.where(touched, average_reward, self.average_reward))
+            self.cumulative_reward.masked_fill_(w, 0)
+            self.cumulative_reward_discount.masked_fill_(w, 1)
+            self.info["log"]["acc_rew_low"] = torch.where(touched.any(), torch.min(self.average_reward), self.info["log"]["acc_rew_low"])
 
-                self.importance_resampling_at_current[env_idx] = self.importance_resampling_at[env_idx] 
-                self.sampling_idx_current[env_idx] = self.sampling_idx[env_idx]
+            self.importance_resampling_at_current.copy_(torch.where(w, self.importance_resampling_at, self.importance_resampling_at_current))
+            self.sampling_idx_current.copy_(torch.where(w, self.sampling_idx, self.sampling_idx_current))
  
         ob = super().observe(env_ids)
 
         if env_ids is None:
             self.goal_t_tensor[:, 0] -= 1
-            m = self.goal_t_tensor[:, 0]<1
-            env_ids_ = self.arange_tensor_n_envs[m]
-            if len(env_ids_): self.update_note_target(env_ids_)
+            self._update_note_target_masked(self.goal_t_tensor[:, 0]<1)
             goal = self.goal_note_tensor
             t = self.goal_t_tensor
         else:
             self.goal_t_tensor[env_ids, 0] -= 1
-            m = self.goal_t_tensor[env_ids, 0]<1
-            env_ids_ = env_ids[m]
-            if len(env_ids_): self.update_note_target(env_ids_)
+            m = torch.zeros((self.n_envs,), dtype=torch.bool, device=self.device)
+            m[env_ids] = self.goal_t_tensor[env_ids, 0]<1
+            self._update_note_target_masked(m)
             goal = self.goal_note_tensor[env_ids]
             t = self.goal_t_tensor[env_ids]
 
@@ -1979,7 +1840,7 @@ class PianoBase(ICCGANHumanoid):
     @torch.no_grad
     def reward(self):
         goal_ = self.goal_note_tensor[:, 0]  # N_envs x N_keys
-        key_qpos = jax2torch(self.mjx_data.qpos[:, self.piano_key_joints], device=self.device)  # N_envs x N_keys
+        key_qpos = self.sim.state("qpos")[:, self.piano_key_joints_tensor]  # N_envs x N_keys
 
         key_press_threshold = 0.9
         key_release_threshold = 0.9
@@ -2224,14 +2085,17 @@ class PianoBase(ICCGANHumanoid):
         precision = (tp/tp_fp).nan_to_num_(nan=1)
 
         m = self.lifetime>self.grace_period
-        self.info["log"]["recall"] = recall[m]
-        self.info["log"]["precision"] = precision[m]
+        # Logged as GPU scalars: the mean over the envs in m (NaN when m is
+        # empty, as .mean() of an empty selection). Selecting recall[m] first
+        # would need a host sync to size the result.
+        self.info["log"]["recall"] = _masked_mean(recall, m)
+        self.info["log"]["precision"] = _masked_mean(precision, m)
         if self.training:
             if self.random_init_note:
                 if self.simulation_step == 0:
-                    self.info["log"]["recall0"] = recall[m]
+                    self.info["log"]["recall0"] = _masked_mean(recall, m)
                 else:
-                    self.info["log"]["recall0"] = recall[m.logical_and(self.sampling_idx_current==0)]
+                    self.info["log"]["recall0"] = _masked_mean(recall, m.logical_and(self.sampling_idx_current==0))
 
         self.info["key_activated"] = self.key_activated
 
@@ -2267,6 +2131,9 @@ class PianoBase(ICCGANHumanoid):
         super().render()
 
         self.viewer.cam.distance = 1.1
+        self._audio_key_state = self.key_activated[0].detach().cpu().numpy().copy()
+        self._audio_key_position = self.key_pos[0].detach().cpu().numpy().copy()
+        self._start_audio()
 
 
         scn = self.viewer.user_scn
@@ -2288,6 +2155,7 @@ class PianoBase(ICCGANHumanoid):
             
         goal = self.key_target[0].cpu().numpy()
         key_activated = self.key_activated[0].cpu().numpy()
+        self._play_audio_for_pressed_keys(key_activated)
 
         for i, (g, k) in enumerate(zip(goal, key_activated)):
             geom = self.mj_model.geom(self.piano_key0_geom+i)
@@ -2352,6 +2220,8 @@ class PianoJointPD(PianoBase):
 
 
 from utils import quat2axang
+
+
 class MuscleTracking(ICCGANHumanoid):
     GOAL_REWARD_WEIGHT = 1
     OB_HORIZON = 1
@@ -2375,23 +2245,15 @@ class MuscleTracking(ICCGANHumanoid):
                 self.env = env
             def state(self, motion_ids, motion_times, with_joint_tensor=False):
                 if with_joint_tensor:
-                    q = jax2torch(self.env.mjx_data.qpos)[:, 7:]
-                    return self.env.link_tensor[:,:self.env.n_char_links if self.env.has_piano else None], (q, q)
+                    q = self.env.sim.state("qpos")[:, 7:]
+                    return self.env.link_tensor[:, :self.env.n_char_links if self.env.has_piano else None], (q, q)
                 else:
-                    return self.env.link_tensor[:,:self.env.n_char_links if self.env.has_piano else None]
+                    return self.env.link_tensor[:, :self.env.n_char_links if self.env.has_piano else None]
         self.ref_motion = DummyRefMotion(self)
-
 
         self.importance_sampling = False
         super().__init__(*args, **kwargs)
 
-        # How many sampling episodes on average each environment will handle
-        # The whole dataset will be roughly splited into N_envs-by-N_importance_sampling chunks at most.
-        # When N_importance_sampling = 0, the wholde dataset will not splited, i.e. N_chunks == N_frames.
-        # The more chunks there are, the more sampling steps are needed to update the (performance) importance w.r.t each chunk.
-        # The training epochs that are neeeded to update the performance of all chunks:
-        #       N_chunks/N_envs * (episode_length/rollout_length)
-        # where int(N_chunks/N_envs) ~= N_importance_sampling
         importance_sampling = kwargs.get("importance_sampling", -1)
         self.importance_discount = kwargs.get("importance_discount", 0.99)
         self.importance_scale = kwargs.get("importance_scale", 6)
@@ -2450,8 +2312,8 @@ class MuscleTracking(ICCGANHumanoid):
         return self.n_char_links*7*self.future_horizon
 
     def prepare_sim(self, opt={}):
-        opt["disableflags"] = 1<<6 + 1<<8 # no gravity, no warmstart
-        opt["gravity"] = [0, 0, 0]
+        opt["disableflags"] = int(mujoco.mjtDisableBit.mjDSBL_GRAVITY) | int(mujoco.mjtDisableBit.mjDSBL_WARMSTART)
+        opt["gravity"] = np.array([0, 0, 0])
         super().prepare_sim(opt)
         self.tracking_motion_ids = torch.zeros((self.n_envs), dtype=torch.int, device=self.device)
         self.tracking_motion_times = torch.zeros((self.n_envs), dtype=torch.float, device=self.device)
@@ -2463,17 +2325,17 @@ class MuscleTracking(ICCGANHumanoid):
         self.arange_tensor_n_envs = torch.arange(self.n_envs, device=self.device)
         self.origin = torch.empty((self.n_envs, 1, 3), dtype=torch.float, device=self.device)
         self.orient = torch.empty((self.n_envs, 1, 4), dtype=torch.float, device=self.device)
-           
+
         self.has_piano = any("P:" in self.mj_model.body(i).name for i in range(self.mj_model.nbody))
         if self.has_piano:
-            self.n_char_links = min(i for i in range(self.mj_model.nbody) if "P:" in self.mj_model.body(i).name) - 1 # exclude world body
+            self.n_char_links = min(i for i in range(self.mj_model.nbody) if "P:" in self.mj_model.body(i).name) - 1
         else:
             self.n_char_links = self.mj_model.nbody - 1
 
         ww = np.zeros(self.n_char_links)
         if self.key_link_weights_orient:
             for link, w in self.key_link_weights_orient.items():
-                lid = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, link)-1 # exclude world body
+                lid = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, link)-1
                 assert lid > -1, "Unrecognized link {}".format(link)
                 ww[lid] = w
             ww /= np.sum(ww)
@@ -2481,7 +2343,7 @@ class MuscleTracking(ICCGANHumanoid):
         ww = np.zeros(self.n_char_links)
         if self.key_link_weights_pos:
             for link, w in self.key_link_weights_pos.items():
-                lid = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, link)-1 # exclude world body
+                lid = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, link)-1
                 assert lid > -1, "Unrecognized link {}".format(link)
                 ww[lid] = w
             ww /= np.sum(ww)
@@ -2506,7 +2368,7 @@ class MuscleTracking(ICCGANHumanoid):
             weights.pow_(self.importance_scale)
             weights.clip_(min=1e-6, max=1e20).nan_to_num_(neginf=None, posinf=1e20, nan=None)
 
-            sid = torch.multinomial(weights, len(env_ids), replacement=True) # N_envs
+            sid = torch.multinomial(weights, len(env_ids), replacement=True)
             frac = torch.from_numpy(np.random.uniform(low=0.0, high=1.0, size=(len(env_ids),))).to(device=self.device, dtype=torch.float)
 
             if self.sampling_gap > 1:
@@ -2515,7 +2377,7 @@ class MuscleTracking(ICCGANHumanoid):
                 frac = sample - fid
             else:
                 fid = self.tracking_motion_samples[sid]
-                
+
             self.sampling_idx[env_ids] = sid.to(torch.long)
             self.cumulative_reward.index_fill_(0, env_ids, 0)
             self.cumulative_reward_discount.index_fill_(0, env_ids, 1)
@@ -2546,11 +2408,11 @@ class MuscleTracking(ICCGANHumanoid):
 
         ref_link_tensor, ref_joint_tensor = \
             self.ref_motion.state(motion_ids, motion_times, with_joint_tensor=True)
-        
+
         if self.future_horizon > 1:
             self.update_tracking_target(env_ids, n=self.future_horizon-1)
         return ref_link_tensor, ref_joint_tensor
-    
+
     def update_tracking_target(self, env_ids, n=1):
         dt = self.step_time*self.control_freq
         if env_ids is None or len(env_ids) == self.n_envs:
@@ -2585,14 +2447,14 @@ class MuscleTracking(ICCGANHumanoid):
                 if self.future_horizon > 1:
                     self.tracking_target[env_ids, :-1] = self.tracking_target[env_ids, 1:].clone()
                 self.tracking_target[env_ids, -1] = target_link_tensor
-        
+
 
     def process_actions(self, actions: torch.Tensor) -> torch.Tensor:
         a = actions[:,:-6]
         self.act = torch.abs(a)
         return torch.cat((a,
             actions[:, -6:]*self.action_scale[-6:] + self.action_offset[-6:]), -1)
-        
+
     def _observe(self, env_ids):
         if env_ids is None:
             n_envs = self.n_envs
@@ -2625,7 +2487,6 @@ class MuscleTracking(ICCGANHumanoid):
 
             target_link_tensor = self.tracking_target[env_ids]
             link_tensor = self.link_tensor[env_ids]
-            env_ids_ = env_ids.cpu().numpy() 
 
         if env_ids is None:
             origin = self.origin
@@ -2634,30 +2495,34 @@ class MuscleTracking(ICCGANHumanoid):
             origin = self.origin[env_ids]
             orient = self.orient[env_ids]
 
-        d = self.mjx_data
-        
         orient_inv = quatconj(orient)
         target_link_tensor = target_link_tensor.view(n_envs, -1, target_link_tensor.size(-1))
         p_ = rotatepoint(orient_inv, target_link_tensor[:,:,:3]-origin).view(n_envs, -1)
         q_ = quatmultiply(orient_inv, target_link_tensor[:,:,3:7]).view(n_envs, -1)
 
-        p = rotatepoint(orient_inv, link_tensor[:,:(self.n_char_links if self.has_piano else None),:3]-origin).view(n_envs, -1)
-        q = quatmultiply(orient_inv, link_tensor[:,:(self.n_char_links if self.has_piano else None),3:7]).view(n_envs, -1)
-        v1 = rotatepoint(orient_inv, link_tensor[:,:(self.n_char_links if self.has_piano else None),7:10]).view(n_envs, -1)
-        v2 = rotatepoint(orient_inv, link_tensor[:,:(self.n_char_links if self.has_piano else None),10:13]).view(n_envs, -1)
+        n_char = self.n_char_links if self.has_piano else None
+        p = rotatepoint(orient_inv, link_tensor[:, :n_char, :3]-origin).view(n_envs, -1)
+        q = quatmultiply(orient_inv, link_tensor[:, :n_char, 3:7]).view(n_envs, -1)
+        v1 = rotatepoint(orient_inv, link_tensor[:, :n_char, 7:10]).view(n_envs, -1)
+        v2 = rotatepoint(orient_inv, link_tensor[:, :n_char, 10:13]).view(n_envs, -1)
 
         obs = [p, q, v1, v2]
 
-        act = jax2torch(d.act if env_ids is None else d.act[env_ids_], device=self.device)
-        obs.append(act)
-        ten_length = jax2torch(d.ten_length if env_ids is None else d.ten_length[env_ids_], device=self.device)
-        obs.append(ten_length)
-        ten_velocity = jax2torch(d.ten_velocity if env_ids is None else d.ten_velocity[env_ids_], device=self.device)
-        obs.append(ten_velocity)
-        
+        act_t = self.sim.state("act")
+        ten_length_t = self.sim.state("ten_length")
+        ten_velocity_t = self.sim.state("ten_velocity")
+        if env_ids is None:
+            obs.append(act_t)
+            obs.append(ten_length_t)
+            obs.append(ten_velocity_t)
+        else:
+            obs.append(act_t[env_ids])
+            obs.append(ten_length_t[env_ids])
+            obs.append(ten_velocity_t[env_ids])
+
         if self.control_freq > 1:
-            obs.append(counter.unsqueeze_(-1))
-        
+            obs.append(counter.unsqueeze_(-1).to(torch.float))
+
         obs.append(p_)
         obs.append(q_)
         ob = torch.cat(obs, -1)
@@ -2666,8 +2531,9 @@ class MuscleTracking(ICCGANHumanoid):
     def reward(self):
         target_orient = self.tracking_target[:, 0, :, 3:7]
         target_pos = self.tracking_target[:, 0, :, :3]
-        link_orient = self.link_tensor[:, :(self.n_char_links if self.has_piano else None), 3:7]
-        link_pos = self.link_tensor[:, :(self.n_char_links if self.has_piano else None), :3]
+        n_char = self.n_char_links if self.has_piano else None
+        link_orient = self.link_tensor[:, :n_char, 3:7]
+        link_pos = self.link_tensor[:, :n_char, :3]
         _, e_a = quat2axang(quatmultiply(link_orient, quatconj(target_orient)))
         e_p = (link_pos - target_pos).square_().sum(-1)
 
@@ -2684,14 +2550,12 @@ class MuscleTracking(ICCGANHumanoid):
             rew += 0.1*torch.exp(-a)
 
         if self.training:
-            tracking_error = self.tracking_error[self.lifetime%self.control_freq == 0]
-            self.info["log"]["wrist"] = tracking_error[:, 2]
-            self.info["log"]["thumb_tip"] = tracking_error[:, 11]
-            self.info["log"]["index_tip"] = tracking_error[:, 18]
-            self.info["log"]["middle_tip"] = tracking_error[:, 23]
-            self.info["log"]["ring_tip"] = tracking_error[:, 28]
-            self.info["log"]["pinky_tip"] = tracking_error[:, 33]
-        
+            # per-link mean over the envs at a control step, as GPU scalars (see PianoBase.reward)
+            m = self.lifetime%self.control_freq == 0
+            for name, link in (("wrist", 2), ("thumb_tip", 11), ("index_tip", 18),
+                               ("middle_tip", 23), ("ring_tip", 28), ("pinky_tip", 33)):
+                self.info["log"][name] = _masked_mean(self.tracking_error[:, link], m)
+
         term = (self.lifetime>self.control_freq*4).logical_and_(torch.any(self.tracking_error > 0.5, -1))
         if self.control_freq > 1:
             m = self.lifetime%self.control_freq == 0
@@ -2715,10 +2579,10 @@ class MuscleTracking(ICCGANHumanoid):
         over = super().overtime_check()
         over.logical_or_(self.lifetime >= self.tracking_motion_length)
         return over
-    
+
     def termination_check(self):
         return self.terminate
-    
+
     def render(self):
         super().render()
 
@@ -2741,7 +2605,7 @@ class MuscleTracking(ICCGANHumanoid):
                     rgba=c,
                 )
                 scn.ngeom += 1
-        
+
 
     def update_viewer(self):
         if self.lifetime[0].item() % self.control_freq != 0:
@@ -2781,7 +2645,6 @@ class MuscleTracking(ICCGANHumanoid):
                     to=p + 0.02*(mat*c[:-1])[:,i],
                 )
 
-
 class PianoMuscleDriven(PianoBase):
 
     def __init__(self, *args, **kwargs):
@@ -2812,7 +2675,7 @@ class PianoMuscleDriven(PianoBase):
         return actions
 
     def do_simulation(self, actions):
-        model = self.mjx_model
+        ctrl = self.sim.state("ctrl")
         if self.two_hands:
             if type(actions) == tuple:
                 actions1, actions2 = actions
@@ -2839,12 +2702,8 @@ class PianoMuscleDriven(PianoBase):
                 s = self.controller_observe(substep)
                 a = controller(s, actions)
                 a.mul_(self.action_scale).add_(self.action_offset)
-            ctrl = torch2jax(a, device=self.jax_device)
-            data = self.mjx_data.replace(ctrl=ctrl)
-            for _ in range(self.frameskip):
-                data = self.mjx_step1(model, data)
-
-            self.mjx_data = data
+            ctrl.copy_(a)
+            self.sim.step(self.frameskip)
 
         self.simulation_step += 1
 
@@ -2952,10 +2811,9 @@ class PianoMuscleDriven(PianoBase):
             counter = torch.full((n_envs,1), counter, dtype=torch.float, device=self.device)
 
         n_char_links = self.n_char_links
-        d = self.mjx_data
-        act = jax2torch(d.act, device=self.device)
-        ten_length = jax2torch(d.ten_length, device=self.device)
-        ten_velocity = jax2torch(d.ten_velocity, device=self.device)
+        act = self.sim.state("act")
+        ten_length = self.sim.state("ten_length")
+        ten_velocity = self.sim.state("ten_velocity")
 
         if self.two_hands:
             act = act.view(n_envs, 2, -1)
