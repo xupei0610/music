@@ -77,9 +77,15 @@ See [`notes/README.md`](notes/README.md) for the file format and the list of pie
 
 ### Pretrained policies
 
-<!-- TODO: add the download link or script for the pretrained policies -->
+Download the pretrained policies from [Hugging Face](https://huggingface.co/datasets/xupei0610/MUSIC), about 1.0 GB:
 
-The pretrained policies go into `pretrained/`:
+```bash
+scripts/download_pretrained.sh                         # everything -> ./pretrained
+scripts/download_pretrained.sh --type joint_hand       # one type
+scripts/download_pretrained.sh --type joint_fingering --pieces 017-1 046-1
+```
+
+The script writes the files into `pretrained/`:
 
 ```text
 pretrained/
@@ -220,9 +226,9 @@ ref_motion.py          # reference motion loader
 piano_audio.py         # piano audio for the viewer
 utils.py               # quaternion helpers
 cfg/                   # configuration files
-assets/                # hand, arm and piano models
+assets/                # hand and piano models
 notes/                 # note-event files
-scripts/               # motion download and the macOS viewer wrapper
+scripts/               # downloads of motions and pretrained policies, and the macOS viewer wrapper
 ```
 
 ## Troubleshooting
