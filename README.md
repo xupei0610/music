@@ -188,6 +188,14 @@ uv run python main.py cfg/muscle.py \
 
 A run that used `--normalize-value` needs this option again for `--resume` and `--test`.
 
+### Faster training with CUDA graphs
+
+Add `--cuda-graph` to replay each PPO and discriminator minibatch update as one CUDA graph.
+Without it, training is bound by the CPU cost of launching thousands of small kernels per update.
+On an RTX 4090 with the joint-driven task, an epoch takes about 1.1 s instead of 11 s.
+The updates match the default path (`scripts/test_cuda_graph_learner.py` checks this).
+The option needs a CUDA device.
+
 ## Viewer and audio
 
 `--test` opens the MuJoCo viewer and plays the policy in real time.

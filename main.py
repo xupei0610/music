@@ -4,6 +4,7 @@ from collections import namedtuple
 
 import env
 from models import ACModel, Discriminator
+from fast_learner import GraphedStep, disc_step, ppo_step
 
 import torch
 import numpy as np
@@ -42,6 +43,10 @@ parser.add_argument("--normalize-value", action="store_true", default=False,
     help="Normalize the critic's value targets with PopArt (sets model_params "
          "normalize_value=True). A checkpoint trained with it has value_normalizer "
          "entries, so --resume and --test with that checkpoint also need this option.")
+
+parser.add_argument("--cuda-graph", action="store_true", default=False,
+    help="Replay each PPO and discriminator minibatch step as one CUDA graph "
+         "(removes the CPU kernel-launch overhead). Needs a CUDA device.")
 
 settings = parser.parse_args()
 
@@ -158,13 +163,23 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
     cols = value_columns(env)
     N_POLICIES = len(models)
 
+    CUDA_GRAPH = settings.cuda_graph
+    if CUDA_GRAPH:
+        # Normal's arg validation syncs the GPU, which breaks graph capture
+        torch.distributions.Distribution.set_default_validate_args(False)
     optimizer = torch.optim.Adam([
         {"params": [p for m in models for p in m.actor.parameters()], "lr": training_params.actor_lr},
         {"params": [p for m in models for p in m.critic.parameters()], "lr": training_params.critic_lr}
-    ])
+    ], capturable=CUDA_GRAPH)
     ac_parameters = [list(m.actor.parameters()) + list(m.critic.parameters()) for m in models]
 
-    disc_optimizer = {name: torch.optim.Adam(disc.parameters(), training_params.disc_lr) for name, disc in model.discriminators.items()}
+    disc_optimizer = {name: torch.optim.Adam(disc.parameters(), training_params.disc_lr, capturable=CUDA_GRAPH) for name, disc in model.discriminators.items()}
+    ppo_graph, disc_graphs = None, {}
+    if CUDA_GRAPH:
+        # graphs bake in the address of all_inst; size it for the largest batch so it is never reallocated
+        for mod in model.modules():
+            if hasattr(mod, "all_inst"):
+                mod.all_inst = torch.arange(N_ENVS*HORIZON, dtype=env.lifetime.dtype, device=env.device)
 
     buffer = dict(s=[], not_done=[], terminate=[], ob_seq_len=[])
     for k in ("a", "v", "lp", "v_"):
@@ -308,37 +323,30 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
                     if len(ob) != n_samples:
                         n_samples = len(ob)
                         idx = torch.randperm(n_samples)
+                    if CUDA_GRAPH and name not in disc_graphs:
+                        disc_graphs[name] = GraphedStep(
+                            lambda r, f, e, disc=disc, opt=opt: disc_step(disc, opt, r, f, e),
+                            [disc], [opt])
+                    scores = []
                     for batch in range(n_samples//BATCH_SIZE):
                         sample = idx[batch*BATCH_SIZE:(batch+1)*BATCH_SIZE]
                         r = ref[sample]
                         f = ob[sample]
                         seq_end_frame = seq_end_frame_[sample]
 
-                        score_r = disc(r, seq_end_frame, normalize=False)
-                        score_f = disc(f, seq_end_frame, normalize=False)
+                        if CUDA_GRAPH:
+                            scores.append(torch.stack(disc_graphs[name](r, f, seq_end_frame)))
+                            continue
 
-                        loss_r = torch.nn.functional.relu(1-score_r).mean()
-                        loss_f = torch.nn.functional.relu(1+score_f).mean()
-
-                        with torch.no_grad():
-                            alpha = torch.rand(r.size(0), dtype=r.dtype, device=r.device)
-                            alpha = alpha.view(-1, *([1]*(r.ndim-1)))
-                            interp = alpha*r+(1-alpha)*f
-                        interp.requires_grad = True
-                        with torch.backends.cudnn.flags(enabled=False):
-                            score_interp = disc(interp, seq_end_frame, normalize=False)
-                        grad = torch.autograd.grad(
-                            score_interp, interp, torch.ones_like(score_interp),
-                            retain_graph=True, create_graph=True, only_inputs=True
-                        )[0]
-                        gp = grad.reshape(grad.size(0), -1).norm(2, dim=1).sub(1).square().mean()
-                        l = loss_f + loss_r + 10*gp
-                        l.backward()
-                        opt.step()
+                        score_r, score_f = disc_step(disc, opt, r, f, seq_end_frame)
                         opt.zero_grad()
 
-                        real_loss.append(score_r.mean().item())
-                        fake_loss.append(score_f.mean().item())
+                        real_loss.append(score_r.item())
+                        fake_loss.append(score_f.item())
+                    if scores:
+                        scores = torch.stack(scores).tolist()
+                        real_loss.extend(x[0] for x in scores)
+                        fake_loss.extend(x[1] for x in scores)
 
             model.eval()
             with torch.no_grad():
@@ -412,43 +420,24 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
                     s = states[sample]
                     end_frame = ob_seq_end_frames[sample]
 
-                    pg_loss, vf_loss = 0, 0
-                    for m, (actions_, log_probs_, advantages_, returns_) in zip(models, batches):
-                        a = actions_[sample]
-                        lp = log_probs_[sample]
-                        adv = advantages_[sample]
-                        v_t = returns_[sample]
+                    minibatch = [x[sample] for b in batches for x in b]
+                    if CUDA_GRAPH:
+                        if ppo_graph is None:
+                            ppo_graph = GraphedStep(
+                                lambda *x: ppo_step(models, optimizer, ac_parameters, REG, *x),
+                                models, [optimizer])
+                        pg_loss, vf_loss = ppo_graph(s, end_frame, *minibatch)
+                        policy_loss.append(torch.stack((pg_loss, vf_loss)))
+                        continue
 
-                        pi_, v_ = m(s, end_frame)
-                        use_reg = REG and m.actor.max_log_sigma is not None
-                        if use_reg:
-                            lp_ = pi_.log_prob(a)
-                            mask = m.actor.logit < m.actor.max_log_sigma
-                            lp_ = torch.where(mask, lp_, lp_.detach())
-                        else:
-                            lp_ = pi_.log_prob(a)
-                        lp_ = lp_.sum(-1, keepdim=True)
-                        ratio = torch.exp(lp_ - lp)
-                        clipped_ratio = torch.clamp(ratio, 1.0-0.2, 1.0+0.2)
-                        pg_loss = pg_loss - torch.min(adv*ratio, adv*clipped_ratio).sum(-1).mean()
-                        vf_loss = vf_loss + (v_ - v_t).square().mean()
-                        
-                        if use_reg:
-                            mask = torch.logical_not(mask)
-                            reg = (mask*pi_.scale).norm(2, dim=1).mean()
-                            pg_loss = pg_loss + REG*reg
-
-                    loss = pg_loss + 0.5*vf_loss
-                    
-                    loss.backward()
-                    for params in ac_parameters:
-                        torch.nn.utils.clip_grad_norm_(params, 1.0)
-
-                    optimizer.step()
+                    pg_loss, vf_loss = ppo_step(models, optimizer, ac_parameters, REG, s, end_frame, *minibatch)
                     optimizer.zero_grad()
 
                     policy_loss.append(pg_loss.item())
                     value_loss.append(vf_loss.item())
+            if CUDA_GRAPH and policy_loss:
+                losses = torch.stack(policy_loss).tolist()
+                policy_loss, value_loss = [x[0] for x in losses], [x[1] for x in losses]
             model.eval()
             epoch += 1
             buffer["s"].clear(); buffer["not_done"].clear(); buffer["terminate"].clear(); buffer["ob_seq_len"].clear()
