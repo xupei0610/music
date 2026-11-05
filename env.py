@@ -29,6 +29,15 @@ def warp2torch(arr) -> torch.Tensor:
     return wp.to_torch(arr)
 
 
+def episode_limit(episode_length):
+    """The hard episode length limit, or None for no limit.
+    None, a missing value or a non-positive number means no limit. A callable
+    (simulation_step -> limit) is kept as it is."""
+    if episode_length is None or callable(episode_length):
+        return episode_length
+    return int(episode_length) if episode_length > 0 else None
+
+
 def _masked_mean(x: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
     """x[m].float().mean() without the host sync of boolean indexing; NaN if m is empty."""
     return torch.where(m, x, 0).float().sum() / m.sum()
@@ -62,7 +71,7 @@ class Env(object):
 
     def __init__(self,
         n_envs: int, fps: int=30, frameskip: int=8,
-        episode_length: Optional[Union[Callable, int]] = 300,
+        episode_length: Optional[Union[Callable, int]] = None,  # None or <= 0: no hard limit
         control_mode: str = "none",
         compute_device: int = 0,
         character_model: Optional[Union[str, Sequence[str]]] = None,
@@ -74,7 +83,7 @@ class Env(object):
         self.step_time = 1./self.fps
         assert control_mode in ["direct", "position", "muscle", "none"]
         self.control_mode = control_mode
-        self.episode_length = episode_length
+        self.episode_length = episode_limit(episode_length)
         # simulator behind the task: "warp" (mujoco_warp, batched, GPU) or "mujoco" (native, CPU)
         self.backend = kwargs.get("backend", "warp")
         self.compute_device = compute_device
@@ -443,7 +452,9 @@ class Env(object):
         raise NotImplementedError()
 
     def overtime_check(self):
-        if self.episode_length is None: return None
+        if self.episode_length is None:
+            # no hard limit: subclasses add their own end conditions to this
+            return torch.zeros(self.n_envs, dtype=torch.bool, device=self.device)
         if callable(self.episode_length):
             return self.lifetime >= self.episode_length(self.simulation_step).to(self.lifetime.device)
         return self.lifetime >= self.episode_length
@@ -1014,7 +1025,8 @@ class PianoBase(ICCGANHumanoid):
         self.grace_period = kwargs.get("grace_period", 10)
 
         self.importance_sampling = False
-        self.episode_length_default = kwargs.get("episode_length", 600)
+        # None: no hard limit, an episode ends with the last note of the track
+        self.episode_length_default = episode_limit(kwargs.get("episode_length"))
 
         goal_reward_weight = kwargs.get("goal_reward_weight", self.GOAL_REWARD_WEIGHT)
         self.multi_objective_reward = hasattr(goal_reward_weight, "__len__") and len(goal_reward_weight) > 1
@@ -1095,8 +1107,12 @@ class PianoBase(ICCGANHumanoid):
                     for j in range(len(dt)-self.note_sampling_range[1]):
                         max_track_frames = max(max_track_frames, torch.sum(dt[j:j+self.note_sampling_range[1]]).item())
                 max_steps = max_track_frames + self.grace_period
+            elif self.episode_length_default is not None:
+                max_steps = self.episode_length_default
             else:
-                max_steps = self.episode_length
+                # no hard limit: the longest episode plays a whole track
+                max_steps = int(max(self.track_t_tensor[s:e].sum().item()
+                    for s, e in zip(self.track_tensor_offset.tolist(), self.track_tensor_offset.tolist()[1:] + [len(self.track_t_tensor)]))) + self.grace_period + 1
 
             discount_rew = [0]*self.grace_period+[self.importance_discount**i for i in range(max_steps-self.grace_period)]+[0]
             boostrap_reward = np.flip(np.cumsum(np.flip(discount_rew)))
@@ -1617,7 +1633,8 @@ class PianoBase(ICCGANHumanoid):
             s = self.track_tensor_offset[i]
             e = len(self.track_note_tensor) if i==len(self.track_tensor_offset)-1 else self.track_tensor_offset[i+1]
             self.track_length_tensor[s+1:e] = torch.cumsum(self.track_t_tensor[s:e-1], 0)
-        self.episode_length = torch.full((self.n_envs,), self.episode_length_default, dtype=torch.int32, device=self.device)
+        no_limit = torch.iinfo(torch.int32).max
+        self.episode_length = torch.full((self.n_envs,), no_limit if self.episode_length_default is None else self.episode_length_default, dtype=torch.int32, device=self.device)
 
         if self.importance_sampling:
             self.info["log"]["acc_rew0"] = self.average_reward[0]
@@ -1697,9 +1714,9 @@ class PianoBase(ICCGANHumanoid):
                 lifetime = self.lifetime[env_ids]
                 lifespan = lifetime.to(timer.dtype).add_(timer)
                 resampling = lifespan + (self.track_length_tensor[note_id_+self.goal_horizon-1] - self.track_length_tensor[note_id_])
-                self.episode_length[env_ids] = lifespan.clip_(min=self.episode_length_default)
+                self.episode_length[env_ids] = lifespan if self.episode_length_default is None else lifespan.clip_(min=self.episode_length_default)
             else:
-                self.episode_length[env_ids] = torch.clip(timer, max=self.episode_length_default)
+                self.episode_length[env_ids] = timer if self.episode_length_default is None else torch.clip(timer, max=self.episode_length_default)
 
             if self.random_init_note:
                 if self.enable_goal_timer:
@@ -2303,7 +2320,10 @@ class MuscleTracking(ICCGANHumanoid):
             for idx, offset in enumerate(self.ref_motion.motion_tensor_offset):
                 self.ref_motion.motion_tensor_id[offset:] = idx
 
-            max_steps = (self.episode_length+1)//self.control_freq
+            if self.episode_length is not None:
+                max_steps = (self.episode_length+1)//self.control_freq
+            else:  # no hard limit: the longest episode plays a whole reference motion
+                max_steps = (int(np.max(self.ref_motion.motion_length) / self.step_time) + 2)//self.control_freq + 1
             boostrap_reward = np.flip(np.cumsum(np.flip([self.importance_discount**i for i in range(max_steps)]+[0])))
             self.boostrap_reward = torch.tensor(np.repeat(boostrap_reward, self.control_freq), dtype=torch.float, device=self.device)
             self.max_rew = self.boostrap_reward[0].item()
@@ -2649,7 +2669,8 @@ class PianoMuscleDriven(PianoBase):
 
     def __init__(self, *args, **kwargs):
         self.controller_steps =  kwargs["control_freq"]
-        kwargs["episode_length"] = kwargs["episode_length"]//(kwargs["frameskip"]*kwargs["control_freq"])
+        limit = episode_limit(kwargs.get("episode_length"))
+        kwargs["episode_length"] = None if limit is None else limit//(kwargs["frameskip"]*kwargs["control_freq"])
         kwargs["frameskip"] = int(kwargs["frameskip"] * kwargs["control_freq"])
         kwargs["fps"] = kwargs["fps"] / self.controller_steps
         super().__init__(*args, **kwargs)
@@ -2854,3 +2875,4 @@ class PianoMuscleDriven(PianoBase):
             s = torch.cat(obs, -1)
 
         return s
+
