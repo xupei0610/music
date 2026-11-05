@@ -162,17 +162,13 @@ uv run python main.py cfg/muscle_tracking_right.py \
 
 ### High-level muscle-driven piano control
 
-A piece-specific high-level policy coordinates the two tracking policies.
+`cfg/muscle.py` trains a piece-specific high-level policy that coordinates the two tracking policies.
 By default, it loads `pretrained/muscle_tracking/muscle_tracking_{left,right}.ckpt`.
-Two configurations train it:
-
-- `cfg/muscle_full.py` starts each episode at the first note and ends it with the last note.
-  The pretrained muscle-driven piano policies use this configuration.
-- `cfg/muscle.py` starts each episode at a random note, with importance sampling, as `cfg/joint.py` does.
-  An episode lasts at most 2.5 s.
+Each training episode starts at the first note and ends with the last note.
+The pretrained muscle-driven piano policies use this configuration.
 
 ```bash
-uv run python main.py cfg/muscle_full.py \
+uv run python main.py cfg/muscle.py \
   --note notes/017-1_fingering.txt \
   --ckpt runs/muscle_017_fingering
 ```
@@ -180,7 +176,7 @@ uv run python main.py cfg/muscle_full.py \
 Evaluate a pretrained policy:
 
 ```bash
-uv run python main.py cfg/muscle_full.py \
+uv run python main.py cfg/muscle.py \
   --note notes/017-1_fingering.txt \
   --ckpt pretrained/muscle_fingering/017-1_fingering.ckpt \
   --test

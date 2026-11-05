@@ -9,7 +9,6 @@ env_params = dict(
     fps = 480,
     frameskip=1,
     control_freq = 8,
-    episode_length = 240*5,
     contactable_links = None,
 
     # mujoco_warp buffers per world. Measured with 2048-4096 envs: ~6 contacts and
@@ -24,12 +23,9 @@ env_params = dict(
 
     goal_reward_weight = [0.4, 0.4],
 
-    random_init_note = True,
-
-    importance_sampling = 0,
-    importance_discount = 0.95,
-    importance_decay = 0.5,
-    importance_scale = 8,
+    # every episode starts at the first note and ends with the last note:
+    # no random start, no importance sampling and no episode_length limit
+    random_init_note = False,
 
     character_model = "assets/two_hands_ds6.5_muscle_driven.xml",
 
