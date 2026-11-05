@@ -77,12 +77,13 @@ See [`notes/README.md`](notes/README.md) for the file format and the list of pie
 
 ### Pretrained policies
 
-Download the pretrained policies from [Hugging Face](https://huggingface.co/datasets/xupei0610/MUSIC), about 1.0 GB:
+Download the pretrained policies from [Hugging Face](https://huggingface.co/datasets/xupei0610/MUSIC), about 2.1 GB:
 
 ```bash
 scripts/download_pretrained.sh                         # everything -> ./pretrained
 scripts/download_pretrained.sh --type joint_hand       # one type
 scripts/download_pretrained.sh --type joint_fingering --pieces 017-1 046-1
+scripts/download_pretrained.sh --type muscle_hand --pieces 052-1
 ```
 
 The script writes the files into `pretrained/`:
@@ -91,23 +92,24 @@ The script writes the files into `pretrained/`:
 pretrained/
   joint_fingering/<piece>_fingering.ckpt   # joint-driven, given fingering (15 pieces)
   joint_hand/<piece>_hand.ckpt             # joint-driven, hand only (15 pieces)
+  muscle_fingering/<piece>_fingering.ckpt  # muscle-driven, given fingering (15 pieces)
+  muscle_hand/<piece>_hand.ckpt            # muscle-driven, hand only (15 pieces)
   muscle_tracking/muscle_tracking_left.ckpt
   muscle_tracking/muscle_tracking_right.ckpt
 ```
-
-> **TODO:** Pretrained high-level muscle-driven piano policies (`cfg/muscle.py`) are not included yet.
-> We will add them in a later update.
 
 Each file keeps only what running the policy needs: the actor and the observation normalizer.
 A file plays the note file with the same name.
 For example, `pretrained/joint_hand/052-1_hand.ckpt` plays `notes/052-1_hand.txt`.
 
-Mean scores of the joint-driven policies over the 15 pieces, one full play of each piece:
+Mean scores of the piano policies over the 15 pieces, one full play of each piece:
 
 | Policies | Frame F1 | Note F1 |
 |---|---|---|
 | `joint_fingering` | 0.990 | 0.983 |
 | `joint_hand` | 0.986 | 0.982 |
+| `muscle_fingering` | 0.973 | 0.905 |
+| `muscle_hand` | 0.964 | 0.890 |
 
 Frame F1 compares the pressed keys with the score at each control frame.
 Note F1 matches a played note to a score note on the same key when the onsets are within 50 ms of each other.
@@ -160,19 +162,33 @@ uv run python main.py cfg/muscle_tracking_right.py \
 
 ### High-level muscle-driven piano control
 
-`cfg/muscle.py` trains a piece-specific high-level policy that coordinates the two tracking policies.
+A piece-specific high-level policy coordinates the two tracking policies.
 By default, it loads `pretrained/muscle_tracking/muscle_tracking_{left,right}.ckpt`.
+Two configurations train it:
+
+- `cfg/muscle_full.py` starts each episode at the first note and ends it with the last note.
+  The pretrained muscle-driven piano policies use this configuration.
+- `cfg/muscle.py` starts each episode at a random note, with importance sampling, as `cfg/joint.py` does.
+  An episode lasts at most 2.5 s.
 
 ```bash
-uv run python main.py cfg/muscle.py \
+uv run python main.py cfg/muscle_full.py \
   --note notes/017-1_fingering.txt \
   --ckpt runs/muscle_017_fingering
 ```
 
-Evaluate it with the same configuration and note file, and add `--test`.
+Evaluate a pretrained policy:
 
-> **TODO:** Pretrained high-level muscle-driven piano policies (`cfg/muscle.py`) are not included yet.
-> We will add them in a later update.
+```bash
+uv run python main.py cfg/muscle_full.py \
+  --note notes/017-1_fingering.txt \
+  --ckpt pretrained/muscle_fingering/017-1_fingering.ckpt \
+  --test
+```
+
+For the policies without fingering, use `notes/<piece>_hand.txt` and `pretrained/muscle_hand/<piece>_hand.ckpt`.
+The piano model has a keybed under the keys (`P:bottom_frame`) that collides with the fingers.
+So a policy cannot move its fingers under the keys.
 
 ### Continue a training run
 

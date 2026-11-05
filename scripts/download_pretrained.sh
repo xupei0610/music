@@ -2,29 +2,30 @@
 # Download the MUSIC pretrained policies (Hugging Face: xupei0610/MUSIC)
 # into ./pretrained (or below --dest), giving pretrained/<type>/<file>.ckpt.
 #
-# Needs only uv (uses `uvx --from huggingface-hub hf`). All files: about 1.0 GB.
+# Needs only uv (uses `uvx --from huggingface-hub hf`). All files: about 2.1 GB.
 #
 #   scripts/download_pretrained.sh                         # everything
 #   scripts/download_pretrained.sh --type joint_hand       # one type
 #   scripts/download_pretrained.sh --type joint_fingering --pieces 017-1 046-1
-#   scripts/download_pretrained.sh --type muscle_tracking
+#   scripts/download_pretrained.sh --type muscle_hand --pieces 052-1
 #
-# Types: joint_fingering, joint_hand, muscle_tracking. --pieces applies to the
-# two joint types. A second run skips the files that are already present.
+# Types: joint_fingering, joint_hand, muscle_fingering, muscle_hand,
+# muscle_tracking. --pieces applies to all types except muscle_tracking.
+# A second run skips the files that are already present.
 set -euo pipefail
 
 REPO="xupei0610/MUSIC"
 DEST="."
-TYPES=(joint_fingering joint_hand muscle_tracking)
+TYPES=(joint_fingering joint_hand muscle_fingering muscle_hand muscle_tracking)
 PIECES=()
 
-usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dest)   DEST="$2"; shift 2 ;;
-    --type)   case "$2" in joint_fingering|joint_hand|muscle_tracking) TYPES=("$2") ;;
-                *) echo "--type must be joint_fingering, joint_hand or muscle_tracking" >&2; exit 2 ;; esac; shift 2 ;;
+    --type)   case "$2" in joint_fingering|joint_hand|muscle_fingering|muscle_hand|muscle_tracking) TYPES=("$2") ;;
+                *) echo "--type must be joint_fingering, joint_hand, muscle_fingering, muscle_hand or muscle_tracking" >&2; exit 2 ;; esac; shift 2 ;;
     --pieces) shift; while [[ $# -gt 0 && "$1" != --* ]]; do PIECES+=("$1"); shift; done ;;
     -h|--help) usage 0 ;;
     *) echo "unknown argument: $1" >&2; usage 2 ;;
@@ -41,7 +42,7 @@ for t in "${TYPES[@]}"; do
   if [[ ${#PIECES[@]} -eq 0 || "$t" == muscle_tracking ]]; then
     INCLUDE+=("pretrained/${t}/*.ckpt")
   else
-    suffix=${t#joint_}
+    suffix=${t#*_}   # joint_hand -> hand, muscle_fingering -> fingering
     for p in "${PIECES[@]}"; do INCLUDE+=("pretrained/${t}/${p}_${suffix}.ckpt"); done
   fi
 done
