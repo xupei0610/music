@@ -1814,7 +1814,12 @@ class PianoBase(ICCGANHumanoid):
             sid = self.sampling_idx_current
             lifetime = (self.simulation_step - self.goal_reset_stamp).clamp_(min=0, max=self.boostrap_reward.size(0)-1)
             boot = self.boostrap_reward[lifetime]
-            p = self.cumulative_reward/(self.max_rew-boot).nan_to_num_(nan=1.)
+            # Some samples end early without a failure, near the end of a track.
+            # Such a sample gets its score rate so far over the steps it did
+            # not play. Its estimate then matches the normal episode length of
+            # the other samples. In the grace period no score exists yet. The
+            # rate is then 0/0, and nan_to_num_ sets it to 1.
+            p = (self.cumulative_reward/(self.max_rew-boot)).nan_to_num_(nan=1.)
             cum = self.cumulative_reward + (~self.info["terminate"])*boot*p
             cnts = torch.zeros_like(self.average_reward, dtype=torch.int64).index_put_((sid,), w.to(torch.int64), accumulate=True)
             buf = torch.zeros_like(self.cumulative_reward_buffer).index_put_((sid,), torch.where(w, cum, 0.), accumulate=True)
