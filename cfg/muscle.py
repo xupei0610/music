@@ -24,12 +24,12 @@ env_params = dict(
 
     goal_reward_weight = [0.4, 0.4],
 
-    random_init_note = False,
+    random_init_note = True,
 
-    # importance_sampling = 0,
-    # importance_discount = 0.95,
-    # importance_decay = 0.5,
-    # importance_scale = 8,
+    importance_sampling = 0,
+    importance_discount = 0.95,
+    importance_decay = 0.5,
+    importance_scale = 8,
 
     character_model = "assets/two_hands_ds6.5_muscle_driven.xml",
 
@@ -112,7 +112,7 @@ training_params = dict(
     max_epochs =    200000,
     save_interval =  20000,
     horizon = 8,
-    num_envs = 1024,
+    num_envs = 2048,
     terminate_reward = -25,
     reg = 10,   # penalty on action stds at the max_sigma cap (see main.py)
 )
