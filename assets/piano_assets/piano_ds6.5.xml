@@ -352,7 +352,11 @@
               <joint name="P:white_joint_87" class="white_key"/>
               </body>
     
-              <!-- 17mm below the white key surface -->
-              <geom name="P:bottom_frame" type="box" pos="0 0.074 -0.0275" size="0.63 0.08 0.0105" contype="0" conaffinity="0" />
+              <!-- Keybed under the keys. The top is at the bottom of the white keys (z = -0.021),
+                   the front is at the front of the keys (y = 0.148), and the box goes down to
+                   z = -0.3. So fingers cannot go under the keys, and fingers that press the keys
+                   do not touch it. contype 1+8: collides with the fingers of both hands
+                   (conaffinity 1 and 8) and with nothing else. -->
+              <geom name="P:bottom_frame" type="box" pos="0 0.071 -0.1605" size="0.63 0.077 0.1395" contype="9" conaffinity="0" />
     
 </mujocoinclude>
