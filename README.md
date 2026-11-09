@@ -200,6 +200,22 @@ uv run python main.py cfg/muscle.py \
 
 A run that used `--normalize-value` needs this option again for `--resume` and `--test`.
 
+### Faster training with CUDA graphs
+
+Add `--cuda-graph` to run each PPO and discriminator minibatch update as a CUDA graph.
+Without it, the updates spend most of their time on the CPU, which launches thousands of small kernels for each update.
+Earlier measurements of this per-minibatch graph scheme used one NVIDIA L40S with 2048 environments:
+
+| Task | Without `--cuda-graph` | With `--cuda-graph` |
+|---|---|---|
+| `cfg/joint.py` | 8.4 s | 2.4 s |
+| `cfg/muscle.py` | 8.1 s | 2.5 s |
+
+The peak GPU memory grows by about 1.5 GB, to about 18 GB.
+The option needs a CUDA device.
+`--resume` works with or without `--cuda-graph`, regardless of the previous run's setting.
+Resume loads optimizer moments and step counts. All optimizer options come from the current run, including learning rates.
+
 ## Viewer and audio
 
 `--test` opens the MuJoCo viewer and plays the policy in real time.
