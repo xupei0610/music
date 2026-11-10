@@ -44,8 +44,8 @@ parser.add_argument("--normalize-value", action="store_true", default=False,
          "entries, so --resume and --test with that checkpoint also need this option.")
 
 parser.add_argument("--cuda-graph", action="store_true", default=False,
-    help="Run each PPO and discriminator minibatch update as a CUDA graph. "
-         "This removes most of the CPU cost of kernel launches. Needs a CUDA device.")
+    help="Compile PPO and discriminator minibatch updates with torch.compile, "
+         "then run them as CUDA graphs. Needs a CUDA device.")
 
 settings = parser.parse_args()
 
@@ -306,8 +306,10 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
     disc_update = {name: (lambda r, f, e, disc=disc, opt=disc_optimizer[name]: disc_step(disc, opt, r, f, e))
         for name, disc in model.discriminators.items()}
     if CUDA_GRAPH:
-        ppo_update = cuda_graph(ppo_update)
-        disc_update = {name: cuda_graph(step) for name, step in disc_update.items()}
+        # Compile first. Explicit capture also records operations outside compiled regions.
+        ppo_update = cuda_graph(torch.compile(ppo_update, mode="default"))
+        disc_update = {name: cuda_graph(torch.compile(step, mode="default"))
+            for name, step in disc_update.items()}
 
     buffer = dict(s=[], not_done=[], terminate=[], ob_seq_len=[])
     for k in ("a", "v", "lp", "v_"):

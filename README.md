@@ -202,16 +202,20 @@ A run that used `--normalize-value` needs this option again for `--resume` and `
 
 ### Faster training with CUDA graphs
 
-Add `--cuda-graph` to run each PPO and discriminator minibatch update as a CUDA graph.
-Without it, the updates spend most of their time on the CPU, which launches thousands of small kernels for each update.
-Earlier measurements of this per-minibatch graph scheme used one NVIDIA L40S with 2048 environments:
+Add `--cuda-graph` to compile each PPO and discriminator minibatch update with `torch.compile(mode="default")`, then capture it as a CUDA graph.
+Compilation optimizes supported operations. Explicit capture reduces launch overhead across compiled regions and operations outside those regions.
+Without the option, the updates run eagerly.
 
-| Task | Without `--cuda-graph` | With `--cuda-graph` |
-|---|---|---|
-| `cfg/joint.py` | 8.4 s | 2.4 s |
-| `cfg/muscle.py` | 8.1 s | 2.5 s |
+A short comparison used the joint task on one NVIDIA L40S with 2048 environments.
+The table gives mean network-update time over epochs 6–10, not total epoch time:
 
-The peak GPU memory grows by about 1.5 GB, to about 18 GB.
+| Update implementation | Mean update time | First update | Peak PyTorch reserved memory |
+|---|---|---|---|
+| CUDA graphs without compilation | 1.863 s | 2.37 s | 4.40 GiB |
+| Compilation plus CUDA graphs | 1.594 s | 22.55 s | 4.48 GiB |
+
+Compilation reduced update time by 14.4%, with more startup time and 84 MiB more reserved memory.
+These memory figures exclude allocations outside PyTorch.
 The option needs a CUDA device.
 `--resume` works with or without `--cuda-graph`, regardless of the previous run's setting.
 Resume loads optimizer moments and step counts. All optimizer options come from the current run, including learning rates.
